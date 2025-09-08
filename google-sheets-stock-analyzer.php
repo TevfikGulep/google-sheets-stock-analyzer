@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           1.8.8
+ * Version:           1.9.4
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -53,7 +53,6 @@ function gssa_admin_page_html() {
         <p>Bu araç, Google E-Tablonuzdaki hisse senetlerini okur, Yahoo Finance'ten veri çeker, analiz eder ve sonuçları E-Tablonuza geri yazar.</p>
 
         <div style="display: flex; gap: 20px;">
-            <!-- Ayarlar Formu -->
             <div style="flex: 1;">
                 <h2>Ayarlar</h2>
                 <form action="options.php" method="post">
@@ -151,7 +150,6 @@ function gssa_admin_page_html() {
                 </form>
             </div>
 
-            <!-- Analiz Kontrol Paneli -->
             <div style="flex: 1;">
                 <h2>Analiz Kontrol Paneli</h2>
                 <div id="gssa-control-panel">
@@ -190,7 +188,7 @@ function gssa_enqueue_admin_scripts($hook) {
         'gssa-admin-js',
         plugin_dir_url(__FILE__) . 'admin.js',
         ['jquery', 'jquery-ui-datepicker'],
-        '1.8.8', 
+        '1.9.4', 
         true
     );
     wp_localize_script('gssa-admin-js', 'gssa_ajax_object', [
@@ -275,7 +273,13 @@ function gssa_start_background_process_callback() {
         wp_send_json_success(['message' => 'Arka plan işlemi başarıyla başlatıldı.']);
 
     } catch (Throwable $e) {
-        $error_message = 'İşlem başlatılamadı: ' . $e->getMessage();
+        // Herhangi bir kritik hata veya istisnayı yakala ve logla
+        $error_message = sprintf(
+            'Kritik Hata: "%s" Dosya: %s Satır: %s',
+            $e->getMessage(),
+            basename($e->getFile()), // Sadece dosya adını göster
+            $e->getLine()
+        );
         gssa_add_log_entry("HATA: " . $error_message);
         update_option('gssa_process_status', 'stopped');
         wp_send_json_error(['message' => $error_message]);
@@ -475,28 +479,8 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     }
 
     if ($needs_options_check) {
-        $options_url = sprintf('https://query1.finance.yahoo.com/v7/finance/options/%s', $symbol);
-        $args = [
-            'timeout' => 20,
-            'headers' => [
-                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            ]
-        ];
-        $options_response = wp_remote_get($options_url, $args);
-
-        if (is_wp_error($options_response) || wp_remote_retrieve_response_code($options_response) != 200) {
-            $has_options = 'Yok (API Hatası)';
-        } else {
-            $options_data = json_decode(wp_remote_retrieve_body($options_response), true);
-            if (
-                !isset($options_data['optionChain']['result'][0]) || 
-                empty($options_data['optionChain']['result'][0]['options'])
-            ) {
-                $has_options = 'Yok';
-            } else {
-                $has_options = 'Var';
-            }
-        }
+        // Yahoo Finance Opsiyon API'si rate limit sorunları nedeniyle geçici olarak devre dışı bırakıldı.
+        $has_options = 'Kontrol Devre Dışı';
     }
 
 
@@ -591,7 +575,7 @@ function gssa_process_single_stock($symbol, $analysis_types) {
 }
 
 function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $percentage_threshold = 1.2) {
-    $summary_template = ['count' => 0, 'total_trading_days' => 0];
+    $summary_template = ['count' => 0, 'intraday_recovery_count' => 0, 'total_trading_days' => 0];
     $summary = ['d365' => $summary_template, 'd90' => $summary_template, 'd60' => $summary_template, 'd30' => $summary_template];
     $today = new DateTime('now', $timezone);
 
@@ -600,26 +584,39 @@ function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $perce
     
     for ($i = 1; $i < count($timestamps); $i++) {
         $current_open = $quotes['open'][$i] ?? null;
+        $current_high = $quotes['high'][$i] ?? null;
         $previous_close = $quotes['close'][$i - 1] ?? null;
 
-        if ($current_open === null || $previous_close === null || $previous_close == 0) continue;
+        if ($current_open === null || $previous_close === null || $previous_close == 0 || $current_high === null) continue;
         
         $current_date = new DateTime('@' . $timestamps[$i]);
         $current_date->setTimezone($timezone);
         $interval_days = $today->diff($current_date)->days;
         
-        if ($interval_days <= 365) $summary['d365']['total_trading_days']++;
-        if ($interval_days <= 90) $summary['d90']['total_trading_days']++;
-        if ($interval_days <= 60) $summary['d60']['total_trading_days']++;
-        if ($interval_days <= 30) $summary['d30']['total_trading_days']++;
+        $periods_to_update = [];
+        if ($interval_days <= 365) $periods_to_update[] = 'd365';
+        if ($interval_days <= 90) $periods_to_update[] = 'd90';
+        if ($interval_days <= 60) $periods_to_update[] = 'd60';
+        if ($interval_days <= 30) $periods_to_update[] = 'd30';
 
-        $percentage_diff = (($current_open / $previous_close) - 1) * 100;
+        foreach($periods_to_update as $period) {
+            $summary[$period]['total_trading_days']++;
+        }
+
+        $opening_percentage_diff = (($current_open / $previous_close) - 1) * 100;
         
-        if ($percentage_diff >= $percentage_threshold) {
-            if ($interval_days <= 365) $summary['d365']['count']++;
-            if ($interval_days <= 90) $summary['d90']['count']++;
-            if ($interval_days <= 60) $summary['d60']['count']++;
-            if ($interval_days <= 30) $summary['d30']['count']++;
+        if ($opening_percentage_diff >= $percentage_threshold) {
+            foreach($periods_to_update as $period) {
+                $summary[$period]['count']++;
+            }
+        } else {
+            // Açılışta geçemedi, gün içi en yükseği kontrol et
+            $intraday_percentage_diff = (($current_high / $previous_close) - 1) * 100;
+            if ($intraday_percentage_diff >= $percentage_threshold) {
+                foreach($periods_to_update as $period) {
+                    $summary[$period]['intraday_recovery_count']++;
+                }
+            }
         }
     }
     return $summary;
@@ -739,8 +736,8 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
         $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
         $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days', 'total_trading_days'];
     } else { // opening_price
-        $stat_headers_base = ['Açılış >= +%' . $percentage_threshold . ' Sayısı', 'Toplam Aktif Gün'];
-        $stat_keys_base = ['count', 'total_trading_days'];
+        $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
+        $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'total_trading_days'];
     }
 
     $header_row = ['Hisse Senedi'];
@@ -754,7 +751,14 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
 
     $data_row = [$symbol];
     foreach ($periods as $period_key => $period_label) {
-        foreach($stat_keys_base as $stat_key) $data_row[] = $summary[$period_key][$stat_key];
+        foreach($stat_keys_base as $stat_key) {
+            if ($stat_key === 'total_count') {
+                $total = ($summary[$period_key]['count'] ?? 0) + ($summary[$period_key]['intraday_recovery_count'] ?? 0);
+                $data_row[] = $total;
+            } else {
+                $data_row[] = $summary[$period_key][$stat_key] ?? 0;
+            }
+        }
     }
     $data_row[] = $split_info;
     if ($type === 'opening_price') {
@@ -806,7 +810,7 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
         } elseif ($type === 'post_market') {
             $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
         } else { // opening_price
-             $stat_headers_base = ['Açılış >= +%' . $percentage_threshold . ' Sayısı', 'Toplam Aktif Gün'];
+             $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
         }
         
         $header_row = ['Hisse Senedi'];
