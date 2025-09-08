@@ -159,7 +159,7 @@ function gssa_admin_page_html() {
                         <button id="gssa-start-opening-price-analysis" class="button button-primary" style="margin-top: 5px;">Sadece Açılış Fiyatı Analizi</button>
                         <button id="gssa-start-both-analysis" class="button button-secondary" style="margin-top: 5px;">Tüm Analizleri Başlat</button>
                     </div>
-                    <div id="gssa-resume-controls" style="display:none;">
+                    <div id="gssa-resume-controls" style="display:none;margin-top: 5px;">
                         <button id="gssa-resume-analysis" class="button button-primary">Kaldığı Yerden Devam Et</button>
                         <button id="gssa-start-fresh-analysis" class="button button-secondary">Sıfırdan Başlat (Tümü)</button>
                     </div>
@@ -357,6 +357,11 @@ function gssa_get_status_log_callback() {
 
 add_action('gssa_run_analysis_cron', 'gssa_run_analysis_cron_callback');
 function gssa_run_analysis_cron_callback() {
+    if (get_option('gssa_process_status') !== 'running') {
+        gssa_add_log_entry("İşlem durdurulmuş olarak algılandı, sonlandırılıyor.");
+        return;
+    }
+
     $queue = get_option('gssa_stock_queue');
     $start_index = (int) get_option('gssa_current_index');
 
@@ -374,7 +379,13 @@ function gssa_run_analysis_cron_callback() {
     
     gssa_add_log_entry("Toplu işlem başlıyor: Index {$start_index} -> " . min($start_index + GSSA_BATCH_SIZE - 1, $total_symbols - 1));
 
+    $i = 0;
     for ($i = 0; $i < GSSA_BATCH_SIZE; $i++) {
+        if (get_option('gssa_process_status') !== 'running') {
+            gssa_add_log_entry("Durdurma sinyali alındı, mevcut toplu işlem durduruluyor.");
+            break; 
+        }
+
         $current_index = $start_index + $i;
         if ($current_index >= $total_symbols) break;
 
@@ -406,12 +417,14 @@ function gssa_run_analysis_cron_callback() {
         }
     }
 
-    $next_index = $start_index + GSSA_BATCH_SIZE;
+    $next_index = $start_index + $i;
     update_option('gssa_current_index', $next_index);
 
-    if ($next_index < $total_symbols) {
+    if (get_option('gssa_process_status') === 'running' && $next_index < $total_symbols) {
         wp_schedule_single_event(time() + 1, 'gssa_run_analysis_cron');
         gssa_spawn_cron();
+    } else if (get_option('gssa_process_status') !== 'running') {
+        gssa_add_log_entry("İşlem duraklatıldı. Bir sonraki cron görevi planlanmadı.");
     } else {
         gssa_add_log_entry("Tüm hisseler başarıyla işlendi.");
         gssa_clear_all_process_data();
@@ -769,15 +782,18 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
         gssa_add_log_entry("İlk hisse ($type), '$writeSheetName' sayfası temizleniyor...");
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
+        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
         
         $values_to_write = [$header_row, $data_row];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
+        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
         $values_to_write = [$data_row];
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
+        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
     }
 }
 
@@ -825,14 +841,17 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
         
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
+        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
         
         $initial_data = [$header_row, $values_to_write[0]];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $initial_data]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
+        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
+        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
     }
 }
 
