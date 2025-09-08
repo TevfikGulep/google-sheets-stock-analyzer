@@ -15,7 +15,7 @@ if (!defined('WPINC')) {
     die;
 }
 
-define('GSSA_BATCH_SIZE', 500); // Her cron çalıştığında işlenecek hisse sayısı
+define('GSSA_BATCH_SIZE', 200); // Her cron çalıştığında işlenecek hisse sayısı
 
 // === 1. PLUGIN ADMIN MENU & SETTINGS ===
 
