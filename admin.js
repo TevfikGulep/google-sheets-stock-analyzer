@@ -147,25 +147,30 @@ jQuery(document).ready(function($) {
                     
                     statusDiv.text(logContent || 'İşlem logu burada görünecek...');
 
+                    // Önce tüm kontrol gruplarını gizle
                     startControls.hide();
                     stopButton.hide();
                     resumeControls.hide();
 
                     if (status === 'running') {
+                        // İşlem çalışıyorsa sadece durdurma butonunu göster
                         stopButton.show().prop('disabled', false).text('İşlemi Durdur');
                         statusInterval = setInterval(updateStatusView, 5000);
                     } else { // 'stopped'
                         const currentIndex = response.data.currentIndex;
                         const totalSymbols = response.data.totalSymbols;
+
+                        // İşlem durduysa, her zaman ana başlatma butonlarını göster
+                        startControls.show();
+                        startControls.find('button').prop('disabled', false).each(function() {
+                            $(this).text($(this).data('original-text'));
+                        });
+
+                        // Eğer devam ettirilebilecek bir işlem varsa, "devam et" kontrollerini de göster
                         if (currentIndex > 0 && currentIndex < totalSymbols) {
                             resumeControls.show();
                             resumeButton.prop('disabled', false);
                             startFreshButton.prop('disabled', false);
-                        } else {
-                            startControls.show();
-                            startControls.find('button').prop('disabled', false).each(function() {
-                                $(this).text($(this).data('original-text'));
-                            });
                         }
                     }
                 } else {
@@ -189,4 +194,3 @@ jQuery(document).ready(function($) {
         });
     }
 });
-
