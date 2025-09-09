@@ -782,18 +782,18 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
         gssa_add_log_entry("İlk hisse ($type), '$writeSheetName' sayfası temizleniyor...");
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         
         $values_to_write = [$header_row, $data_row];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
         $values_to_write = [$data_row];
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
     }
 }
 
@@ -841,17 +841,17 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
         
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         
         $initial_data = [$header_row, $values_to_write[0]];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $initial_data]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
     }
 }
 
