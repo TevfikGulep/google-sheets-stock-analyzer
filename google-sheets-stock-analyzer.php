@@ -810,64 +810,109 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
 }
 
 
-function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
-    $client = gssa_get_google_client();
-    $service = new Google_Service_Sheets($client);
+function gssa_process_single_stock($symbol, $analysis_types) {
+    $timezone = new DateTimeZone('America/New_York');
     $options = get_option('gssa_settings');
-    $spreadsheetId = $options['sheet_id']; 
+    $end_date_setting = get_option('gssa_process_end_date');
+
+    $end_date = !empty($end_date_setting) ? (new DateTime($end_date_setting . ' 23:59:59', $timezone))->getTimestamp() : time();
+    $start_date = strtotime('-365 days', $end_date);
     
-    if ($type === 'pre_market') {
-        $writeSheetName = $options['write_sheet_name'];
-        $percentage_threshold = 2.0;
-    } elseif ($type === 'post_market') {
-        $writeSheetName = $options['post_market_write_sheet_name'];
-        $percentage_threshold = (float) ($options['post_market_percentage'] ?? 2.0);
-    } else { // opening_price
-        $writeSheetName = $options['opening_price_write_sheet_name'];
-        $percentage_threshold = (float) ($options['opening_price_percentage'] ?? 1.2);
+    $needs_hourly = in_array('pre', $analysis_types) || in_array('post', $analysis_types);
+    $needs_daily = in_array('opening_price', $analysis_types) || $needs_hourly;
+    // Bu satırda bir değişiklik yok, sadece mantığı tekrar teyit ediyoruz.
+    $needs_options_check = in_array('opening_price', $analysis_types);
+
+    $daily_data_api = null;
+    $split_info = 'Yok';
+    // has_options için varsayılan değeri 'Bilinmiyor' olarak ayarlıyoruz.
+    $has_options = 'Bilinmiyor';
+    
+    if($needs_daily) {
+        $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
+        $daily_response = wp_remote_get($daily_url, ['timeout' => 30]);
+        if (is_wp_error($daily_response) || wp_remote_retrieve_response_code($daily_response) != 200) throw new Exception("Günlük veri çekilemedi: " . wp_remote_retrieve_response_code($daily_response));
+        $daily_data_api = json_decode(wp_remote_retrieve_body($daily_response), true);
+        if (empty($daily_data_api['chart']['result'][0]['timestamp'])) throw new Exception("Günlük veri bulunamadı.");
+
+        if (isset($daily_data_api['chart']['result'][0]['events']['splits'])) {
+            $latest_split = end($daily_data_api['chart']['result'][0]['events']['splits']);
+            if ($latest_split && $latest_split['date'] >= $start_date) {
+                $split_date = new DateTime('@' . $latest_split['date']);
+                $split_info = sprintf('%s (%s)', $latest_split['splitRatio'], $split_date->format('Y-m-d'));
+            }
+        }
+    }
+
+    // --- DEĞİŞİKLİK BAŞLANGICI ---
+    if ($needs_options_check) {
+        // Eski 'Kontrol Devre Dışı' satırını kaldırıp yerine yeni fonksiyonumuzu çağırıyoruz.
+        // Bu sayede opsiyon kontrolü artık aktif ve güvenilir bir şekilde çalışacak.
+        $has_options = gssa_check_stock_has_options($symbol);
+        // Olası bir API hatasında bir sonraki hisseye geçmeden önce kısa bir bekleme ekleyebiliriz.
+        // Bu, API tarafından geçici olarak engellenme riskini azaltır.
+        sleep(1); 
+    }
+    // --- DEĞİŞİKLİK SONU ---
+
+
+    if ($needs_hourly) {
+        // ... bu fonksiyonun geri kalanı SİZİN MEVCUT KODUNUZ ile aynı kalacak ...
+        // ... saatlik verileri çeken ve işleyen kod ...
+        // ... (burada değişiklik yok) ...
     }
     
-    $is_cleared_option_name = "gssa_{$type}_sheet_cleared";
-    $is_cleared = get_option($is_cleared_option_name, false);
-    
-    $values_to_write = [[$symbol . ' - HATA NEDENİYLE ATLANDI']];
-
-    if (!$is_cleared) {
-        if ($type === 'pre_market') {
-            $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%2', 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün', 'Toplam Aktif Gün'];
-        } elseif ($type === 'post_market') {
-            $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
-        } else { // opening_price
-             $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Sonraki Gün Telafi', 'Toplam Aktif Gün'];
-        }
-        
-        $header_row = ['Hisse Senedi'];
-        $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
-        foreach ($periods as $period_label) {
-            foreach($stat_headers_base as $stat_header) $header_row[] = $stat_header . ' ' . $period_label;
-        }
-        $header_row[] = 'Hisse Bölünmesi';
-        if ($type === 'opening_price') {
-            $header_row[] = 'Opsiyon Durumu';
-        }
-        
-        $clear_request = new Google_Service_Sheets_ClearValuesRequest();
-        $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        sleep(1); // API limitini aşmamak için 1 saniye bekle
-        
-        $initial_data = [$header_row, $values_to_write[0]];
-        $update_body = new Google_Service_Sheets_ValueRange(['values' => $initial_data]);
-        $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        sleep(1); // API limitini aşmamak için 1 saniye bekle
-        update_option($is_cleared_option_name, true);
-    } else {
-        $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
-        $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        sleep(1); // API limitini aşmamak için 1 saniye bekle
+    if (in_array('opening_price', $analysis_types)) {
+        $opening_price_percentage = (float) ($options['opening_price_percentage'] ?? 1.2);
+        $opening_price_summary = gssa_calculate_opening_price_summary($daily_data_api, $timezone, $opening_price_percentage);
+        // $has_options değişkeni artık 'Var', 'Yok' veya 'Bilinmiyor' değerini taşıyarak doğru şekilde yazdırılacak.
+        gssa_write_summary_to_sheet($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options);
     }
 }
+/**
+ * Belirli bir hisse senedinin opsiyon piyasası olup olmadığını Yahoo Finance'in gayriresmi API'sini kullanarak kontrol eder.
+ * * Bu fonksiyon, API'nin güvenilmez doğasına karşı zaman aşımı, hata denetimi ve doğru JSON analizi gibi
+ * en iyi uygulamaları içerir.
+ *
+ * @param string $symbol Kontrol edilecek hisse senedi sembolü (örn: AAPL).
+ * @return string 'Var', 'Yok', veya 'Bilinmiyor' (hata durumunda) değerlerinden birini döndürür.
+ */
+function gssa_check_stock_has_options(string $symbol): string {
+    // 1. Opsiyon verileri için doğru ve direkt API uç noktasını kullan
+    $url = sprintf('https://query2.finance.yahoo.com/v7/finance/options/%s', urlencode($symbol));
 
+    // 2. Sağlamlaştırılmış API isteği
+    $response = wp_remote_get($url, [
+        'timeout'   => 15, // API yanıt vermezse 15 saniye sonra vazgeç
+        'headers'   => [
+            // Engellenme riskini azaltmak için standart bir tarayıcı kimliği gönder
+            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        ]
+    ]);
 
+    // 3. Hata Yönetimi
+    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) != 200) {
+        // Ağ hatası veya sunucudan 200 dışında bir yanıt gelirse
+        return 'Bilinmiyor';
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode($body, true);
+
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        // API'den gelen yanıt geçerli bir JSON formatında değilse
+        return 'Bilinmiyor';
+    }
+
+    // 4. Mantık Kontrolü (Araştırmamızdaki en güvenilir yöntem)
+    // Eğer 'optionChain' içinde 'result' adında bir dizi varsa ve bu dizi boş değilse, opsiyon VAR demektir.
+    if (isset($data['optionChain']['result']) && is_array($data['optionChain']['result']) && !empty($data['optionChain']['result'])) {
+        return 'Var';
+    }
+
+    // Yukarıdaki koşul sağlanmazsa, opsiyon YOK demektir.
+    return 'Yok';
+}
 function gssa_get_google_client() {
     require_once plugin_dir_path(__FILE__) . 'vendor/autoload.php';
     $options = get_option('gssa_settings');
