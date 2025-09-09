@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           1.9.4
+ * Version:           1.9.5
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -588,7 +588,7 @@ function gssa_process_single_stock($symbol, $analysis_types) {
 }
 
 function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $percentage_threshold = 1.2) {
-    $summary_template = ['count' => 0, 'intraday_recovery_count' => 0, 'total_trading_days' => 0];
+    $summary_template = ['count' => 0, 'intraday_recovery_count' => 0, 'next_day_recovery_count' => 0, 'total_trading_days' => 0];
     $summary = ['d365' => $summary_template, 'd90' => $summary_template, 'd60' => $summary_template, 'd30' => $summary_template];
     $today = new DateTime('now', $timezone);
 
@@ -623,11 +623,23 @@ function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $perce
                 $summary[$period]['count']++;
             }
         } else {
-            // Açılışta geçemedi, gün içi en yükseği kontrol et
             $intraday_percentage_diff = (($current_high / $previous_close) - 1) * 100;
             if ($intraday_percentage_diff >= $percentage_threshold) {
                 foreach($periods_to_update as $period) {
                     $summary[$period]['intraday_recovery_count']++;
+                }
+            } else {
+                // Açılış ve gün içi telafi olmadıysa, bir sonraki günün zirvesine bak
+                if (isset($timestamps[$i + 1])) {
+                    $next_day_high = $quotes['high'][$i + 1] ?? null;
+                    if ($next_day_high !== null) {
+                        $next_day_percentage_diff = (($next_day_high / $previous_close) - 1) * 100;
+                        if ($next_day_percentage_diff >= $percentage_threshold) {
+                             foreach($periods_to_update as $period) {
+                                $summary[$period]['next_day_recovery_count']++;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -749,8 +761,8 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
         $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
         $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days', 'total_trading_days'];
     } else { // opening_price
-        $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
-        $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'total_trading_days'];
+        $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Sonraki Gün Telafi', 'Toplam Aktif Gün'];
+        $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'next_day_recovery_count', 'total_trading_days'];
     }
 
     $header_row = ['Hisse Senedi'];
@@ -766,7 +778,7 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
     foreach ($periods as $period_key => $period_label) {
         foreach($stat_keys_base as $stat_key) {
             if ($stat_key === 'total_count') {
-                $total = ($summary[$period_key]['count'] ?? 0) + ($summary[$period_key]['intraday_recovery_count'] ?? 0);
+                $total = ($summary[$period_key]['count'] ?? 0) + ($summary[$period_key]['intraday_recovery_count'] ?? 0) + ($summary[$period_key]['next_day_recovery_count'] ?? 0);
                 $data_row[] = $total;
             } else {
                 $data_row[] = $summary[$period_key][$stat_key] ?? 0;
@@ -782,18 +794,18 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
         gssa_add_log_entry("İlk hisse ($type), '$writeSheetName' sayfası temizleniyor...");
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        sleep(2); // API limitini aşmamak için 1 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         
         $values_to_write = [$header_row, $data_row];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        sleep(2); // API limitini aşmamak için 1 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
         $values_to_write = [$data_row];
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        sleep(2); // API limitini aşmamak için 1 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
     }
 }
 
@@ -826,7 +838,7 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
         } elseif ($type === 'post_market') {
             $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
         } else { // opening_price
-             $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
+             $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Sonraki Gün Telafi', 'Toplam Aktif Gün'];
         }
         
         $header_row = ['Hisse Senedi'];
@@ -841,17 +853,17 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
         
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        sleep(2); // API limitini aşmamak için 1 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         
         $initial_data = [$header_row, $values_to_write[0]];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $initial_data]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        sleep(2); // API limitini aşmamak için 1 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        sleep(2); // API limitini aşmamak için 1 saniye bekle
+        sleep(1); // API limitini aşmamak için 1 saniye bekle
     }
 }
 
