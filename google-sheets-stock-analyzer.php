@@ -2,13 +2,17 @@
 /**
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
- * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           1.9.5
+ * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet. This is an optimized version with robust API handling, custom database tables for performance, and intelligent caching.
+ * Version:           2.0.2
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:       gssa
+ *
+ * @info For optimal performance and reliability, it is highly recommended to disable the default WP-Cron
+ * and use a server-side cron job. Add `define('DISABLE_WP_CRON', true);` to your wp-config.php file,
+ * and set up a server cron to hit `https://yourdomain.com/wp-cron.php?doing_wp_cron` every 5 minutes.
  */
 
 if (!defined('WPINC')) {
@@ -16,6 +20,39 @@ if (!defined('WPINC')) {
 }
 
 define('GSSA_BATCH_SIZE', 200); // Her cron çalıştığında işlenecek hisse sayısı
+
+// === 0. PLUGIN ACTIVATION (DATABASE SETUP) ===
+
+register_activation_hook(__FILE__, 'gssa_install');
+function gssa_install() {
+    global $wpdb;
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $queue_table_name = $wpdb->prefix . 'gssa_queue';
+    $logs_table_name = $wpdb->prefix . 'gssa_logs';
+
+    $sql_queue = "CREATE TABLE $queue_table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        symbol varchar(20) NOT NULL,
+        analysis_types varchar(100) NOT NULL,
+        status varchar(20) DEFAULT 'pending' NOT NULL,
+        PRIMARY KEY  (id),
+        KEY symbol (symbol),
+        KEY status (status)
+    ) $charset_collate;";
+
+    $sql_logs = "CREATE TABLE $logs_table_name (
+        id bigint(20) NOT NULL AUTO_INCREMENT,
+        log_time datetime DEFAULT '0000-00-00 00:00:00' NOT NULL,
+        message text NOT NULL,
+        PRIMARY KEY  (id)
+    ) $charset_collate;";
+
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql_queue);
+    dbDelta($sql_logs);
+}
+
 
 // === 1. PLUGIN ADMIN MENU & SETTINGS ===
 
@@ -52,8 +89,8 @@ function gssa_admin_page_html() {
         <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
         <p>Bu araç, Google E-Tablonuzdaki hisse senetlerini okur, Yahoo Finance'ten veri çeker, analiz eder ve sonuçları E-Tablonuza geri yazar.</p>
 
-        <div style="display: flex; gap: 20px;">
-            <div style="flex: 1;">
+        <div style="display: flex; flex-wrap: wrap; gap: 20px;">
+            <div style="flex: 1; min-width: 350px;">
                 <h2>Ayarlar</h2>
                 <form action="options.php" method="post">
                     <?php
@@ -150,7 +187,7 @@ function gssa_admin_page_html() {
                 </form>
             </div>
 
-            <div style="flex: 1;">
+            <div style="flex: 1; min-width: 350px;">
                 <h2>Analiz Kontrol Paneli</h2>
                 <div id="gssa-control-panel">
                     <div id="gssa-start-controls">
@@ -159,11 +196,15 @@ function gssa_admin_page_html() {
                         <button id="gssa-start-opening-price-analysis" class="button button-primary" style="margin-top: 5px;">Sadece Açılış Fiyatı Analizi</button>
                         <button id="gssa-start-both-analysis" class="button button-secondary" style="margin-top: 5px;">Tüm Analizleri Başlat</button>
                     </div>
-                    <div id="gssa-resume-controls" style="display:none;margin-top: 5px;">
+                    <div id="gssa-resume-controls" style="display:none; margin-top: 5px;">
                         <button id="gssa-resume-analysis" class="button button-primary">Kaldığı Yerden Devam Et</button>
                         <button id="gssa-start-fresh-analysis" class="button button-secondary">Sıfırdan Başlat (Tümü)</button>
                     </div>
-                    <button id="gssa-stop-analysis" class="button button-secondary" style="display:none;">İşlemi Durdur</button>
+                    <div id="gssa-running-controls" style="display:none; margin-top: 10px;">
+                        <button id="gssa-stop-analysis" class="button button-secondary">İşlemi Durdur</button>
+                        <button id="gssa-manual-trigger" class="button button-primary" style="margin-left: 10px;">Arka Plan İşlemini Manuel Tetikle</button>
+                        <p class="description">Sunucunuz otomatik başlatmayı desteklemiyorsa, işlemi ilerletmek için manuel tetikleme butonunu kullanın.</p>
+                    </div>
                     <div id="gssa-status" style="margin-top: 20px; padding: 10px; background-color: #f7f7f7; border: 1px solid #ccc; border-radius: 4px; min-height: 200px; max-height: 400px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;">
                         İşlem logu burada görünecek...
                     </div>
@@ -188,7 +229,7 @@ function gssa_enqueue_admin_scripts($hook) {
         'gssa-admin-js',
         plugin_dir_url(__FILE__) . 'admin.js',
         ['jquery', 'jquery-ui-datepicker'],
-        '1.9.4', 
+        '2.0.2', 
         true
     );
     wp_localize_script('gssa-admin-js', 'gssa_ajax_object', [
@@ -201,6 +242,7 @@ function gssa_enqueue_admin_scripts($hook) {
 
 add_action('wp_ajax_gssa_start_background_process', 'gssa_start_background_process_callback');
 function gssa_start_background_process_callback() {
+    global $wpdb;
     try {
         check_ajax_referer('gssa_ajax_nonce', 'nonce');
         
@@ -215,7 +257,7 @@ function gssa_start_background_process_callback() {
         $spreadsheetId = $options['sheet_id'];
         $pre_symbols = [];
         $post_symbols = [];
-        $opening_price_symbols = []; 
+        $opening_price_symbols = [];
 
         if ($analysis_mode === 'pre' || $analysis_mode === 'both') {
             if (empty($options['pre_market_read_sheet_name']) || empty($options['pre_market_symbol_range'])) throw new Exception("Pre-Market kaynak ayarları eksik.");
@@ -253,19 +295,22 @@ function gssa_start_background_process_callback() {
             foreach ($opening_price_symbols as $symbol) $symbol_map[$symbol] = isset($symbol_map[$symbol]) ? $symbol_map[$symbol] . ',opening_price' : 'opening_price';
         }
         
-        $queue = [];
+        $queue_table = $wpdb->prefix . 'gssa_queue';
         foreach ($symbol_map as $symbol => $type) {
-            $queue[] = [$symbol, $type];
+            $wpdb->insert(
+                $queue_table,
+                ['symbol' => $symbol, 'analysis_types' => $type, 'status' => 'pending'],
+                ['%s', '%s', '%s']
+            );
         }
 
-        update_option('gssa_stock_queue', $queue);
-        update_option('gssa_current_index', 0);
         update_option('gssa_process_end_date', sanitize_text_field($options['end_date'] ?? ''));
         update_option('gssa_pre_market_sheet_cleared', false);
         update_option('gssa_post_market_sheet_cleared', false);
         update_option('gssa_opening_price_sheet_cleared', false); 
         update_option('gssa_process_status', 'running');
-        gssa_add_log_entry("İşlem başlatıldı. Toplam " . count($queue) . " benzersiz hisse işlenecek.");
+        gssa_add_log_entry("İşlem başlatıldı. Toplam " . count($symbol_map) . " benzersiz hisse işlenecek.");
+        gssa_add_log_entry("Arka plan görevi planlandı. Sunucunuzun tetiklemesi bekleniyor veya manuel tetikleme kullanın.");
 
         wp_schedule_single_event(time(), 'gssa_run_analysis_cron');
         gssa_spawn_cron();
@@ -273,11 +318,10 @@ function gssa_start_background_process_callback() {
         wp_send_json_success(['message' => 'Arka plan işlemi başarıyla başlatıldı.']);
 
     } catch (Throwable $e) {
-        // Herhangi bir kritik hata veya istisnayı yakala ve logla
         $error_message = sprintf(
             'Kritik Hata: "%s" Dosya: %s Satır: %s',
             $e->getMessage(),
-            basename($e->getFile()), // Sadece dosya adını göster
+            basename($e->getFile()),
             $e->getLine()
         );
         gssa_add_log_entry("HATA: " . $error_message);
@@ -300,14 +344,17 @@ function gssa_get_symbols_from_sheet($service, $spreadsheetId, $range) {
 
 add_action('wp_ajax_gssa_resume_background_process', 'gssa_resume_background_process_callback');
 function gssa_resume_background_process_callback() {
+    global $wpdb;
     try {
         check_ajax_referer('gssa_ajax_nonce', 'nonce');
-        $index = get_option('gssa_current_index', false);
-        if ($index === false) {
-            wp_send_json_error(['message' => 'Devam edilecek bir işlem bulunamadı. Lütfen sıfırdan başlatın.']);
+        $queue_table = $wpdb->prefix . 'gssa_queue';
+        $pending_count = $wpdb->get_var("SELECT COUNT(*) FROM $queue_table WHERE status = 'pending'");
+
+        if ($pending_count == 0) {
+            wp_send_json_error(['message' => 'Devam ettirilecek bekleyen hisse yok.']);
             return;
         }
-        gssa_add_log_entry("İşleme index {$index}'dan devam ediliyor...");
+        gssa_add_log_entry("İşleme devam ediliyor...");
         update_option('gssa_process_status', 'running');
         wp_clear_scheduled_hook('gssa_run_analysis_cron');
         wp_schedule_single_event(time(), 'gssa_run_analysis_cron');
@@ -333,116 +380,149 @@ function gssa_stop_background_process_callback() {
 
 add_action('wp_ajax_gssa_get_status_log', 'gssa_get_status_log_callback');
 function gssa_get_status_log_callback() {
+    global $wpdb;
     try {
         check_ajax_referer('gssa_ajax_nonce', 'nonce');
         
-        $log = get_option('gssa_process_log', []);
-        $status = get_option('gssa_process_status', 'stopped');
-        $current_index = get_option('gssa_current_index', 0);
-        $queue = get_option('gssa_stock_queue', []);
+        $logs_table = $wpdb->prefix . 'gssa_logs';
+        $queue_table = $wpdb->prefix . 'gssa_queue';
 
-        if (!is_array($queue)) $queue = [];
-        if (!is_array($log)) $log = [];
-        
+        $log_entries = $wpdb->get_results("SELECT log_time, message FROM $logs_table ORDER BY id DESC LIMIT 200");
+        $log_array = array_map(function($entry) {
+            return $entry->log_time . ' - ' . $entry->message;
+        }, $log_entries);
+        $log_string = implode("\n", $log_array);
+
+        $status = get_option('gssa_process_status', 'stopped');
+        $total_symbols = (int) $wpdb->get_var("SELECT COUNT(*) FROM $queue_table");
+        $processed_symbols = (int) $wpdb->get_var("SELECT COUNT(*) FROM $queue_table WHERE status != 'pending'");
+        $pending_count = $total_symbols - $processed_symbols;
+
         wp_send_json_success([
-            'log' => $log, 
-            'status' => $status, 
-            'currentIndex' => (int) $current_index, 
-            'totalSymbols' => count($queue)
+            'log'            => $log_string,
+            'status'         => $status,
+            'total'          => $total_symbols,
+            'processed'      => $processed_symbols,
+            'pending_exists' => ($pending_count > 0)
         ]);
+
     } catch (Throwable $e) {
-        wp_send_json_error(['message' => 'Durum bilgisi alınırken sunucu hatası oluştu: ' . $e->getMessage()]);
+        wp_send_json_error(['message' => 'Logları alırken hata oluştu: ' . $e->getMessage()]);
+    }
+}
+
+add_action('wp_ajax_gssa_manual_trigger_cron', 'gssa_manual_trigger_cron_callback');
+function gssa_manual_trigger_cron_callback() {
+    try {
+        check_ajax_referer('gssa_ajax_nonce', 'nonce');
+        gssa_add_log_entry("Arka plan işlemi manuel olarak tetiklendi.");
+        // Directly call the cron function
+        gssa_run_analysis_cron_callback();
+        wp_send_json_success(['message' => 'Manuel tetikleme başarılı.']);
+    } catch (Throwable $e) {
+        gssa_add_log_entry("Manuel tetikleme sırasında hata: " . $e->getMessage());
+        wp_send_json_error(['message' => 'Manuel tetikleme başarısız: ' . $e->getMessage()]);
     }
 }
 
 add_action('gssa_run_analysis_cron', 'gssa_run_analysis_cron_callback');
 function gssa_run_analysis_cron_callback() {
+    global $wpdb;
+
     if (get_option('gssa_process_status') !== 'running') {
-        gssa_add_log_entry("İşlem durdurulmuş olarak algılandı, sonlandırılıyor.");
+        gssa_add_log_entry("İşlem 'çalışıyor' durumunda değil, sonlandırılıyor.");
+        wp_clear_scheduled_hook('gssa_run_analysis_cron');
         return;
     }
 
-    $queue = get_option('gssa_stock_queue');
-    $start_index = (int) get_option('gssa_current_index');
+    gssa_add_log_entry("Arka plan görevi başarıyla tetiklendi. Hisse grubu işleniyor...");
+    $queue_table = $wpdb->prefix . 'gssa_queue';
+    $batch = $wpdb->get_results($wpdb->prepare(
+        "SELECT * FROM $queue_table WHERE status = 'pending' LIMIT %d",
+        GSSA_BATCH_SIZE
+    ));
 
-    if ($queue === false || $start_index === false) {
-        update_option('gssa_process_status', 'stopped');
-        return;
-    }
-
-    $total_symbols = count($queue);
-    if ($start_index >= $total_symbols) {
-        gssa_add_log_entry("Tüm hisseler başarıyla işlendi.");
+    if (empty($batch)) {
+        gssa_add_log_entry("Tüm hisseler başarıyla işlendi. İşlem tamamlandı.");
         gssa_clear_all_process_data();
         return;
     }
-    
-    gssa_add_log_entry("Toplu işlem başlıyor: Index {$start_index} -> " . min($start_index + GSSA_BATCH_SIZE - 1, $total_symbols - 1));
 
-    $i = 0;
-    for ($i = 0; $i < GSSA_BATCH_SIZE; $i++) {
+    $total_symbols = (int) $wpdb->get_var("SELECT COUNT(*) FROM $queue_table");
+    $processed_count_before = (int) $wpdb->get_var("SELECT COUNT(*) FROM $queue_table WHERE status != 'pending'");
+
+    gssa_add_log_entry("Toplu işlem başlıyor: " . count($batch) . " hisse işlenecek.");
+
+    foreach ($batch as $item) {
         if (get_option('gssa_process_status') !== 'running') {
             gssa_add_log_entry("Durdurma sinyali alındı, mevcut toplu işlem durduruluyor.");
             break; 
         }
 
-        $current_index = $start_index + $i;
-        if ($current_index >= $total_symbols) break;
+        $processed_count_before++;
+        $symbol = $item->symbol;
+        $analysis_types = explode(',', $item->analysis_types);
 
-        $item = $queue[$current_index];
-        $symbol = $item[0];
-        $analysis_types = explode(',', $item[1]);
-
-        gssa_add_log_entry("İşleniyor: {$symbol} (" . implode(', ', $analysis_types) . ") (" . ($current_index + 1) . "/" . $total_symbols . ")");
+        gssa_add_log_entry("İşleniyor: {$symbol} (" . implode(', ', $analysis_types) . ") (" . $processed_count_before . "/" . $total_symbols . ")");
 
         try {
             gssa_process_single_stock($symbol, $analysis_types);
-            gssa_add_log_entry("Başarılı: {$symbol} işlendi ve yazıldı.");
+            $wpdb->update($queue_table, ['status' => 'completed'], ['id' => $item->id]);
         } catch (Exception $e) {
+            $wpdb->update($queue_table, ['status' => 'error'], ['id' => $item->id]);
             gssa_add_log_entry("HATA ({$symbol}): İşlem sırasında hata oluştuğu için ATLANDI. Hata: " . $e->getMessage());
             try {
-                if (in_array('pre', $analysis_types)) {
-                    gssa_write_skipped_stock_to_sheet($symbol, 'pre_market');
-                }
-                if (in_array('post', $analysis_types)) {
-                    gssa_write_skipped_stock_to_sheet($symbol, 'post_market');
-                }
-                if (in_array('opening_price', $analysis_types)) { 
-                    gssa_write_skipped_stock_to_sheet($symbol, 'opening_price');
-                }
-                gssa_add_log_entry("Bilgi: {$symbol} için ilgili E-Tablo(lar)a atlama kaydı düşüldü.");
+                if (in_array('pre', $analysis_types)) gssa_write_skipped_stock_to_sheet($symbol, 'pre_market');
+                if (in_array('post', $analysis_types)) gssa_write_skipped_stock_to_sheet($symbol, 'post_market');
+                if (in_array('opening_price', $analysis_types)) gssa_write_skipped_stock_to_sheet($symbol, 'opening_price');
             } catch (Exception $write_e) {
                 gssa_add_log_entry("UYARI: {$symbol} için atlama kaydı E-Tablo'ya yazılamadı. Hata: " . $write_e->getMessage());
             }
         }
     }
 
-    $next_index = $start_index + $i;
-    update_option('gssa_current_index', $next_index);
-
-    if (get_option('gssa_process_status') === 'running' && $next_index < $total_symbols) {
+    $pending_count = (int) $wpdb->get_var("SELECT COUNT(*) FROM $queue_table WHERE status = 'pending'");
+    if (get_option('gssa_process_status') === 'running' && $pending_count > 0) {
+        wp_clear_scheduled_hook('gssa_run_analysis_cron');
         wp_schedule_single_event(time() + 1, 'gssa_run_analysis_cron');
         gssa_spawn_cron();
     } else if (get_option('gssa_process_status') !== 'running') {
         gssa_add_log_entry("İşlem duraklatıldı. Bir sonraki cron görevi planlanmadı.");
     } else {
-        gssa_add_log_entry("Tüm hisseler başarıyla işlendi.");
+        gssa_add_log_entry("Tüm hisseler başarıyla işlendi. İşlem tamamlandı.");
         gssa_clear_all_process_data();
     }
 }
 
 function gssa_add_log_entry($message) {
-    $log = get_option('gssa_process_log', []);
-    array_unshift($log, wp_date('Y-m-d H:i:s') . ' - ' . $message);
-    if (count($log) > 200) $log = array_slice($log, 0, 200);
-    update_option('gssa_process_log', $log);
+    global $wpdb;
+    $logs_table = $wpdb->prefix . 'gssa_logs';
+    
+    $wpdb->insert(
+        $logs_table,
+        [
+            'log_time' => current_time('mysql'),
+            'message'  => $message
+        ],
+        ['%s', '%s']
+    );
+
+    // Keep the log table from growing indefinitely
+    $log_count = $wpdb->get_var("SELECT COUNT(*) FROM $logs_table");
+    if ($log_count > 5000) {
+        $wpdb->query("DELETE FROM $logs_table ORDER BY id ASC LIMIT 1000");
+    }
 }
 
 function gssa_clear_all_process_data() {
+    global $wpdb;
     wp_clear_scheduled_hook('gssa_run_analysis_cron');
-    delete_option('gssa_stock_queue');
-    delete_option('gssa_current_index');
-    delete_option('gssa_error_counts');
+    
+    $queue_table = $wpdb->prefix . 'gssa_queue';
+    $logs_table = $wpdb->prefix . 'gssa_logs';
+    $wpdb->query("TRUNCATE TABLE $queue_table");
+    $wpdb->query("TRUNCATE TABLE $logs_table");
+
     delete_option('gssa_process_end_date');
     delete_option('gssa_pre_market_sheet_cleared');
     delete_option('gssa_post_market_sheet_cleared');
@@ -458,6 +538,8 @@ function gssa_spawn_cron() {
         'sslverify' => apply_filters('https_local_ssl_verify', false),
     ]);
 }
+
+// === 4. CORE DATA PROCESSING LOGIC ===
 
 function gssa_process_single_stock($symbol, $analysis_types) {
     $timezone = new DateTimeZone('America/New_York');
@@ -476,32 +558,45 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     $has_options = 'Bilinmiyor';
     
     if($needs_daily) {
-        $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
-        $daily_response = wp_remote_get($daily_url, ['timeout' => 30]);
-        if (is_wp_error($daily_response) || wp_remote_retrieve_response_code($daily_response) != 200) throw new Exception("Günlük veri çekilemedi: " . wp_remote_retrieve_response_code($daily_response));
-        $daily_data_api = json_decode(wp_remote_retrieve_body($daily_response), true);
+        $daily_transient_key = 'gssa_daily_' . md5($symbol . $start_date . $end_date);
+        $daily_data_api = get_transient($daily_transient_key);
+
+        if (false === $daily_data_api) {
+            $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
+            $daily_response = wp_remote_get($daily_url, ['timeout' => 30]);
+            if (is_wp_error($daily_response) || wp_remote_retrieve_response_code($daily_response) != 200) throw new Exception("Günlük veri çekilemedi: " . wp_remote_retrieve_response_code($daily_response));
+            $daily_data_api = json_decode(wp_remote_retrieve_body($daily_response), true);
+            set_transient($daily_transient_key, $daily_data_api, 4 * HOUR_IN_SECONDS);
+        }
+
         if (empty($daily_data_api['chart']['result'][0]['timestamp'])) throw new Exception("Günlük veri bulunamadı.");
 
         if (isset($daily_data_api['chart']['result'][0]['events']['splits'])) {
             $latest_split = end($daily_data_api['chart']['result'][0]['events']['splits']);
             if ($latest_split && $latest_split['date'] >= $start_date) {
                 $split_date = new DateTime('@' . $latest_split['date']);
-                $split_info = sprintf('%s (%s)', $latest_split['splitRatio'], $split_date->format('Y-m-d'));
+                $split_info = sprintf('%s/%s (%s)', $latest_split['numerator'], $latest_split['denominator'], $split_date->format('Y-m-d'));
             }
         }
     }
 
     if ($needs_options_check) {
-        // Yahoo Finance Opsiyon API'si rate limit sorunları nedeniyle geçici olarak devre dışı bırakıldı.
-        $has_options = 'Kontrol Devre Dışı';
+        $has_options = gssa_check_stock_has_options($symbol);
+        sleep(1); 
     }
 
-
     if ($needs_hourly) {
-        $hourly_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1h&includePrePost=true', $symbol, $start_date, $end_date);
-        $hourly_response = wp_remote_get($hourly_url, ['timeout' => 30]);
-        if (is_wp_error($hourly_response) || wp_remote_retrieve_response_code($hourly_response) != 200) throw new Exception("Saatlik veri çekilemedi: " . wp_remote_retrieve_response_code($hourly_response));
-        $hourly_data_api = json_decode(wp_remote_retrieve_body($hourly_response), true);
+        $hourly_transient_key = 'gssa_hourly_' . md5($symbol . $start_date . $end_date);
+        $hourly_data_api = get_transient($hourly_transient_key);
+
+        if (false === $hourly_data_api) {
+            $hourly_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1h&includePrePost=true', $symbol, $start_date, $end_date);
+            $hourly_response = wp_remote_get($hourly_url, ['timeout' => 30]);
+            if (is_wp_error($hourly_response) || wp_remote_retrieve_response_code($hourly_response) != 200) throw new Exception("Saatlik veri çekilemedi: " . wp_remote_retrieve_response_code($hourly_response));
+            $hourly_data_api = json_decode(wp_remote_retrieve_body($hourly_response), true);
+            set_transient($hourly_transient_key, $hourly_data_api, 4 * HOUR_IN_SECONDS);
+        }
+        
         if (empty($hourly_data_api['chart']['result'][0]['timestamp'])) throw new Exception("Saatlik veri bulunamadı.");
 
         $official_closes = [];
@@ -552,17 +647,18 @@ function gssa_process_single_stock($symbol, $analysis_types) {
                 'pre_market_opens' => [], 'pre_market_activity' => false, 'post_market_activity' => false
             ];
             
+            $first_pre_market_open = !empty($day_hourly['pre_market_opens']) ? reset($day_hourly['pre_market_opens']) : null;
+            
             $metrics = [
                 'close' => $official_closes[$date] ?? null, 
                 'pre_market_high' => !empty($day_hourly['pre_market_highs']) ? max($day_hourly['pre_market_highs']) : null, 
                 'intraday_high' => !empty($day_hourly['market_highs']) ? max($day_hourly['market_highs']) : null,
                 'post_market_high' => !empty($day_hourly['post_market_highs']) ? max($day_hourly['post_market_highs']) : null,
                 'pre_market_percent_diff' => null, 'post_market_percent_diff' => null, 'pre_market_open_percent' => null,
-                'pre_market_activity' => $day_hourly['pre_market_activity'], 'post_market_activity' => $day_hourly['post_market_activity']
-            ];
+                'pre_market_activity' => $day_hourly['pre_market_activity'], 'post_market_activity' => $day_hourly['post_market_activity']];
 
             if ($previous_day_close !== null && $metrics['pre_market_high'] !== null) $metrics['pre_market_percent_diff'] = (($metrics['pre_market_high'] / $previous_day_close) - 1) * 100;
-            if ($previous_day_close !== null && !empty($day_hourly['pre_market_opens'])) $metrics['pre_market_open_percent'] = (($day_hourly['pre_market_opens'][0] / $previous_day_close) - 1) * 100;
+            if ($previous_day_close !== null && $first_pre_market_open !== null) $metrics['pre_market_open_percent'] = (($first_pre_market_open / $previous_day_close) - 1) * 100;
             if ($metrics['close'] !== null && $metrics['post_market_high'] !== null) $metrics['post_market_percent_diff'] = (($metrics['post_market_high'] / $metrics['close']) - 1) * 100;
 
             $processed_data[$date] = $metrics;
@@ -629,7 +725,6 @@ function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $perce
                     $summary[$period]['intraday_recovery_count']++;
                 }
             } else {
-                // Açılış ve gün içi telafi olmadıysa, bir sonraki günün zirvesine bak
                 if (isset($timestamps[$i + 1])) {
                     $next_day_high = $quotes['high'][$i + 1] ?? null;
                     if ($next_day_high !== null) {
@@ -755,17 +850,17 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
     $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
     
     if ($type === 'pre_market') {
-        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%2', 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün', 'Toplam Aktif Gün'];
+        $stat_headers_base = ['Toplam >%2', 'P.M. >%2', 'Gün İçi >%2', 'P.M. <%2', 'Özel Durum', 'Gün İçi Top.', 'Zayıf Gün', 'Aktif Gün', 'İşlem Günü'];
         $stat_keys_base = ['total_over_threshold', 'over_threshold', 'intraday_over_2_percent', 'under_threshold', 'special_case', 'intraday_recovery', 'weak_day', 'active_days', 'total_trading_days'];
     } elseif ($type === 'post_market') {
-        $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
+        $stat_headers_base = [">%". $percentage_threshold, "<%". $percentage_threshold, 'Aktif Gün', 'İşlem Günü'];
         $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days', 'total_trading_days'];
     } else { // opening_price
-        $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Sonraki Gün Telafi', 'Toplam Aktif Gün'];
+        $stat_headers_base = ["Toplam >%{$percentage_threshold}", "Açılış >%{$percentage_threshold}", "Gün İçi Top.", "Ertesi Gün Top.", "İşlem Günü"];
         $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'next_day_recovery_count', 'total_trading_days'];
     }
 
-    $header_row = ['Hisse Senedi'];
+    $header_row = ['Hisse'];
     foreach ($periods as $period_label) {
         foreach($stat_headers_base as $stat_header) $header_row[] = $stat_header . ' ' . $period_label;
     }
@@ -790,129 +885,78 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
         $data_row[] = $has_options;
     }
 
+    $params = ['valueInputOption' => 'USER_ENTERED'];
     if (!$is_cleared) {
         gssa_add_log_entry("İlk hisse ($type), '$writeSheetName' sayfası temizleniyor...");
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        sleep(1); // API limitini aşmamak için 1 saniye bekle
+        sleep(1);
         
         $values_to_write = [$header_row, $data_row];
         $update_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
-        $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        sleep(1); // API limitini aşmamak için 1 saniye bekle
+        $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, $params);
+        sleep(1);
         update_option($is_cleared_option_name, true);
     } else {
         $values_to_write = [$data_row];
         $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
-        $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        sleep(1); // API limitini aşmamak için 1 saniye bekle
+        $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, $params);
+        sleep(1);
     }
 }
 
-
-function gssa_process_single_stock($symbol, $analysis_types) {
-    $timezone = new DateTimeZone('America/New_York');
-    $options = get_option('gssa_settings');
-    $end_date_setting = get_option('gssa_process_end_date');
-
-    $end_date = !empty($end_date_setting) ? (new DateTime($end_date_setting . ' 23:59:59', $timezone))->getTimestamp() : time();
-    $start_date = strtotime('-365 days', $end_date);
-    
-    $needs_hourly = in_array('pre', $analysis_types) || in_array('post', $analysis_types);
-    $needs_daily = in_array('opening_price', $analysis_types) || $needs_hourly;
-    // Bu satırda bir değişiklik yok, sadece mantığı tekrar teyit ediyoruz.
-    $needs_options_check = in_array('opening_price', $analysis_types);
-
-    $daily_data_api = null;
-    $split_info = 'Yok';
-    // has_options için varsayılan değeri 'Bilinmiyor' olarak ayarlıyoruz.
-    $has_options = 'Bilinmiyor';
-    
-    if($needs_daily) {
-        $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
-        $daily_response = wp_remote_get($daily_url, ['timeout' => 30]);
-        if (is_wp_error($daily_response) || wp_remote_retrieve_response_code($daily_response) != 200) throw new Exception("Günlük veri çekilemedi: " . wp_remote_retrieve_response_code($daily_response));
-        $daily_data_api = json_decode(wp_remote_retrieve_body($daily_response), true);
-        if (empty($daily_data_api['chart']['result'][0]['timestamp'])) throw new Exception("Günlük veri bulunamadı.");
-
-        if (isset($daily_data_api['chart']['result'][0]['events']['splits'])) {
-            $latest_split = end($daily_data_api['chart']['result'][0]['events']['splits']);
-            if ($latest_split && $latest_split['date'] >= $start_date) {
-                $split_date = new DateTime('@' . $latest_split['date']);
-                $split_info = sprintf('%s (%s)', $latest_split['splitRatio'], $split_date->format('Y-m-d'));
-            }
-        }
-    }
-
-    // --- DEĞİŞİKLİK BAŞLANGICI ---
-    if ($needs_options_check) {
-        // Eski 'Kontrol Devre Dışı' satırını kaldırıp yerine yeni fonksiyonumuzu çağırıyoruz.
-        // Bu sayede opsiyon kontrolü artık aktif ve güvenilir bir şekilde çalışacak.
-        $has_options = gssa_check_stock_has_options($symbol);
-        // Olası bir API hatasında bir sonraki hisseye geçmeden önce kısa bir bekleme ekleyebiliriz.
-        // Bu, API tarafından geçici olarak engellenme riskini azaltır.
-        sleep(1); 
-    }
-    // --- DEĞİŞİKLİK SONU ---
-
-
-    if ($needs_hourly) {
-        // ... bu fonksiyonun geri kalanı SİZİN MEVCUT KODUNUZ ile aynı kalacak ...
-        // ... saatlik verileri çeken ve işleyen kod ...
-        // ... (burada değişiklik yok) ...
-    }
-    
-    if (in_array('opening_price', $analysis_types)) {
-        $opening_price_percentage = (float) ($options['opening_price_percentage'] ?? 1.2);
-        $opening_price_summary = gssa_calculate_opening_price_summary($daily_data_api, $timezone, $opening_price_percentage);
-        // $has_options değişkeni artık 'Var', 'Yok' veya 'Bilinmiyor' değerini taşıyarak doğru şekilde yazdırılacak.
-        gssa_write_summary_to_sheet($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options);
-    }
-}
 /**
- * Belirli bir hisse senedinin opsiyon piyasası olup olmadığını Yahoo Finance'in gayriresmi API'sini kullanarak kontrol eder.
- * * Bu fonksiyon, API'nin güvenilmez doğasına karşı zaman aşımı, hata denetimi ve doğru JSON analizi gibi
+ * Belirli bir hisse senedinin opsiyon piyasası olup olmadığını Yahoo Finance'in API'sini kullanarak kontrol eder.
+ * Bu fonksiyon, API'nin güvenilmez doğasına karşı zaman aşımı, hata denetimi ve doğru JSON analizi gibi
  * en iyi uygulamaları içerir.
  *
  * @param string $symbol Kontrol edilecek hisse senedi sembolü (örn: AAPL).
  * @return string 'Var', 'Yok', veya 'Bilinmiyor' (hata durumunda) değerlerinden birini döndürür.
  */
 function gssa_check_stock_has_options(string $symbol): string {
-    // 1. Opsiyon verileri için doğru ve direkt API uç noktasını kullan
+    $transient_key = 'gssa_options_' . $symbol;
+    $cached_result = get_transient($transient_key);
+    if (false !== $cached_result) {
+        return $cached_result;
+    }
+
     $url = sprintf('https://query2.finance.yahoo.com/v7/finance/options/%s', urlencode($symbol));
 
-    // 2. Sağlamlaştırılmış API isteği
-    $response = wp_remote_get($url, [
-        'timeout'   => 15, // API yanıt vermezse 15 saniye sonra vazgeç
-        'headers'   => [
-            // Engellenme riskini azaltmak için standart bir tarayıcı kimliği gönder
-            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        ]
-    ]);
+    $response = wp_remote_get($url, ['timeout' => 15]);
 
-    // 3. Hata Yönetimi
-    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) != 200) {
-        // Ağ hatası veya sunucudan 200 dışında bir yanıt gelirse
+    // 1. WordPress seviyesindeki taşıma hatalarını kontrol et (örn: cURL hatası, DNS hatası)
+    if (is_wp_error($response)) {
+        gssa_add_log_entry("API Hatası (WP_Error for {$symbol}): " . $response->get_error_message());
+        return 'Bilinmiyor';
+    }
+
+    // 2. 200 olmayan HTTP durum kodlarını kontrol et (örn: 404, 429, 50x)
+    $status_code = wp_remote_retrieve_response_code($response);
+    if ($status_code !== 200) {
+        gssa_add_log_entry("API Hatası (HTTP {$status_code}) for symbol: {$symbol}");
         return 'Bilinmiyor';
     }
 
     $body = wp_remote_retrieve_body($response);
     $data = json_decode($body, true);
 
+    // 3. JSON çözümleme hatasını kontrol et (Yahoo'dan bozuk formatta yanıt gelmesi)
     if (json_last_error() !== JSON_ERROR_NONE) {
-        // API'den gelen yanıt geçerli bir JSON formatında değilse
+        gssa_add_log_entry("API Hatası (JSON Decode for {$symbol}): " . json_last_error_msg());
         return 'Bilinmiyor';
     }
 
-    // 4. Mantık Kontrolü (Araştırmamızdaki en güvenilir yöntem)
-    // Eğer 'optionChain' içinde 'result' adında bir dizi varsa ve bu dizi boş değilse, opsiyon VAR demektir.
+    // 4. Opsiyon verisinin varlığını doğrulamak için JSON yapısını güvenli bir şekilde kontrol et
     if (isset($data['optionChain']['result']) && is_array($data['optionChain']['result']) && !empty($data['optionChain']['result'])) {
+        set_transient($transient_key, 'Var', 12 * HOUR_IN_SECONDS);
         return 'Var';
     }
-
-    // Yukarıdaki koşul sağlanmazsa, opsiyon YOK demektir.
+    
+    // 5. 'result' anahtarı var ama boşsa veya yapı beklenmedik ise, opsiyon olmadığını güvenle belirleyebiliriz.
+    set_transient($transient_key, 'Yok', 12 * HOUR_IN_SECONDS);
     return 'Yok';
 }
+
 function gssa_get_google_client() {
     require_once plugin_dir_path(__FILE__) . 'vendor/autoload.php';
     $options = get_option('gssa_settings');
@@ -930,5 +974,46 @@ function gssa_get_google_client() {
     $client->setAccessType('offline');
     $client->setAuthConfig($credentials_array);
     return $client;
+}
+
+/**
+ * Hata nedeniyle atlanan hisseleri E-Tablo'ya not düşer.
+ *
+ * @param string $symbol Atlanan hisse senedi sembolü.
+ * @param string $type Analiz türü ('pre_market', 'post_market', 'opening_price').
+ */
+function gssa_write_skipped_stock_to_sheet($symbol, $type) {
+    $options = get_option('gssa_settings');
+    $spreadsheetId = $options['sheet_id'];
+    
+    if ($type === 'pre_market') {
+        $writeSheetName = $options['write_sheet_name'];
+        $col_count = 38; // Pre-market header count + 1
+    } elseif ($type === 'post_market') {
+        $writeSheetName = $options['post_market_write_sheet_name'];
+        $col_count = 18; // Post-market header count + 1
+    } else { // opening_price
+        $writeSheetName = $options['opening_price_write_sheet_name'];
+        $col_count = 24; // Opening price header count + 1
+    }
+
+    if (empty($writeSheetName)) {
+        throw new Exception("Yazılacak sayfa adı ($type) için ayarlanmamış.");
+    }
+    
+    $data_row = [$symbol, 'HATA - Atlandı'];
+    // Kalan sütunları boş bırakmak için doldur
+    for ($i = 2; $i < $col_count; $i++) {
+        $data_row[] = '';
+    }
+    
+    $client = gssa_get_google_client();
+    $service = new Google_Service_Sheets($client);
+    
+    $values_to_write = [$data_row];
+    $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
+    $params = ['valueInputOption' => 'USER_ENTERED'];
+    $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, $params);
+    sleep(1); // API limitlerini aşmamak için bekle
 }
 ?>
