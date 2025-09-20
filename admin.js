@@ -4,10 +4,12 @@ jQuery(document).ready(function($) {
     const startPostButton = $('#gssa-start-post-analysis');
     const startOpeningPriceButton = $('#gssa-start-opening-price-analysis');
     const startBothButton = $('#gssa-start-both-analysis');
-    const stopButton = $('#gssa-stop-analysis');
     const resumeControls = $('#gssa-resume-controls');
     const resumeButton = $('#gssa-resume-analysis');
     const startFreshButton = $('#gssa-start-fresh-analysis');
+    const runningControls = $('#gssa-running-controls');
+    const stopButton = $('#gssa-stop-analysis');
+    const manualTriggerButton = $('#gssa-manual-trigger');
     const statusDiv = $('#gssa-status');
     let statusInterval;
 
@@ -29,6 +31,7 @@ jQuery(document).ready(function($) {
 
         button.prop('disabled', true).text('Başlatılıyor...');
         startControls.find('button').prop('disabled', true);
+        resumeControls.find('button').prop('disabled', true);
         statusDiv.html('İşlem başlatılıyor, lütfen bekleyin...');
 
         $.ajax({
@@ -128,6 +131,31 @@ jQuery(document).ready(function($) {
         });
     });
 
+    manualTriggerButton.on('click', function() {
+        $(this).prop('disabled', true).text('Tetikleniyor...');
+        $.ajax({
+            url: gssa_ajax_object.ajax_url,
+            type: 'POST',
+            data: {
+                action: 'gssa_manual_trigger_cron',
+                nonce: gssa_ajax_object.nonce
+            },
+            success: function(response) {
+                // Sadece status view'ı yenilemek yeterli, o zaten logları çekecek
+                updateStatusView();
+            },
+            error: function() {
+                statusDiv.prepend('<strong>Hata:</strong> Manuel tetikleme isteği gönderilemedi.<br>');
+            },
+            complete: function() {
+                // Butonu tekrar aktif et, ama hemen değil ki sürekli basılmasın
+                setTimeout(function() {
+                    manualTriggerButton.prop('disabled', false).text('Arka Plan İşlemini Manuel Tetikle');
+                }, 2000);
+            }
+        });
+    });
+
     function updateStatusView() {
         if (statusInterval) {
             clearInterval(statusInterval);
@@ -141,44 +169,56 @@ jQuery(document).ready(function($) {
                 nonce: gssa_ajax_object.nonce
             },
             success: function(response) {
-                if (response && response.success) {
+                if (response && response.success && response.data) {
                     const status = response.data.status;
-                    const logContent = response.data.log.join('\n');
-                    
-                    statusDiv.text(logContent || 'İşlem logu burada görünecek...');
+                    const logContent = response.data.log;
+                    const total = response.data.total || 0;
+                    const processed = response.data.processed || 0;
 
-                    // Önce tüm kontrol gruplarını gizle
+                    let progressText = "";
+                    if (total > 0 || status === 'running') {
+                        let statusMessage = status === 'running' ? 'Çalışıyor' : 'Durdu';
+                        progressText = `<div style="padding-bottom: 10px; border-bottom: 1px solid #ddd; margin-bottom: 10px; font-weight: bold;">Durum: ${statusMessage} [${processed} / ${total}]</div>`;
+                    }
+
+                    let logHtml = '';
+                    if (logContent && logContent.trim() !== '') {
+                        const escapedLog = $('<div />').text(logContent).html();
+                        logHtml = escapedLog.replace(/\n/g, '<br>');
+                    } else if (status === 'running') {
+                        logHtml = 'İşlem çalışıyor, log çıktısı bekleniyor...';
+                    } else {
+                        logHtml = 'İşlem logu burada görünecek...';
+                    }
+                    
+                    statusDiv.html(progressText + logHtml);
+                    statusDiv.scrollTop(0);
+
+                    // Kontrol butonlarının görünürlüğünü ayarla
                     startControls.hide();
-                    stopButton.hide();
                     resumeControls.hide();
+                    runningControls.hide();
 
                     if (status === 'running') {
-                        // İşlem çalışıyorsa sadece durdurma butonunu göster
-                        stopButton.show().prop('disabled', false).text('İşlemi Durdur');
+                        runningControls.show();
+                        stopButton.prop('disabled', false).text('İşlemi Durdur');
+                        manualTriggerButton.prop('disabled', false).text('Arka Plan İşlemini Manuel Tetikle');
                         statusInterval = setInterval(updateStatusView, 5000);
                     } else { // 'stopped'
-                        const currentIndex = response.data.currentIndex;
-                        const totalSymbols = response.data.totalSymbols;
-
-                        // İşlem durduysa, her zaman ana başlatma butonlarını göster
+                        const pendingExists = response.data.pending_exists;
                         startControls.show();
                         startControls.find('button').prop('disabled', false).each(function() {
                             $(this).text($(this).data('original-text'));
                         });
-
-                        // Eğer devam ettirilebilecek bir işlem varsa, "devam et" kontrollerini de göster
-                        if (currentIndex > 0 && currentIndex < totalSymbols) {
+                        if (pendingExists) {
                             resumeControls.show();
                             resumeButton.prop('disabled', false);
                             startFreshButton.prop('disabled', false);
                         }
                     }
                 } else {
-                     let errorMessage = 'Durum bilgisi alınamadı (sunucudan geçersiz yanıt).';
-                     if(response && response.data && response.data.message){
-                         errorMessage = 'Sunucu Hatası: ' + response.data.message;
-                     }
-                    statusDiv.text(errorMessage);
+                     let errorMessage = '<strong>Hata:</strong> Sunucudan geçersiz veya başarısız bir yanıt alındı. Bu genellikle sunucu tarafında bir PHP hatası olduğunu gösterir.<br><br><strong>Ham Sunucu Yanıtı:</strong><pre>' + JSON.stringify(response, null, 2) + '</pre>';
+                     statusDiv.html(errorMessage);
                 }
             },
             error: function(xhr, status, error) {
@@ -194,3 +234,4 @@ jQuery(document).ready(function($) {
         });
     }
 });
+
