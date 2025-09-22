@@ -177,6 +177,12 @@ jQuery(document).ready(function($) {
                      let errorMessage = 'Durum bilgisi alınamadı (sunucudan geçersiz yanıt).';
                      if(response && response.data && response.data.message){
                          errorMessage = 'Sunucu Hatası: ' + response.data.message;
+                     } else if (response) {
+                        try {
+                            errorMessage += ' Detaylar: ' + JSON.stringify(response);
+                        } catch (e) {
+                            // Ignore stringify errors
+                        }
                      }
                     statusDiv.text(errorMessage);
                 }
