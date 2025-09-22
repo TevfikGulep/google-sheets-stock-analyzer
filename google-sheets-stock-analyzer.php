@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           1.9.4
+ * Version:           1.9.9
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -80,6 +80,13 @@ function gssa_admin_page_html() {
                          <tr valign="top">
                             <th scope="row">Sonuç Tab Adı</th>
                             <td><input type="text" name="gssa_settings[write_sheet_name]" value="<?php echo esc_attr($options['write_sheet_name'] ?? ''); ?>" size="50" placeholder="Örn: PreMarketSonuclar"/></td>
+                        </tr>
+                        <tr valign="top">
+                            <th scope="row">Yüzde Eşiği (%)</th>
+                            <td>
+                                <input type="number" step="0.1" name="gssa_settings[pre_market_percentage]" value="<?php echo esc_attr($options['pre_market_percentage'] ?? '2'); ?>" />
+                                <p class="description">Pre-market analizinde kullanılacak yüzde eşiği. Varsayılan: 2</p>
+                            </td>
                         </tr>
 
                         <tr valign="top" style="border-top: 1px solid #ccc;">
@@ -164,7 +171,7 @@ function gssa_admin_page_html() {
                         <button id="gssa-start-fresh-analysis" class="button button-secondary">Sıfırdan Başlat (Tümü)</button>
                     </div>
                     <button id="gssa-stop-analysis" class="button button-secondary" style="display:none;">İşlemi Durdur</button>
-                    <div id="gssa-status" style="margin-top: 20px; padding: 10px; background-color: #f7f7f7; border: 1px solid #ccc; border-radius: 4px; min-height: 200px; max-height: 400px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;">
+                    <div id="gssa-status" style="margin-top: 20px; padding: 10px; background-color: #f7f7f7; border: 1px solid #ccc; border-radius: 4px; min-height: 200px; max-h: 400px; overflow-y: auto; font-family: monospace; white-space: pre-wrap;">
                         İşlem logu burada görünecek...
                     </div>
                 </div>
@@ -188,7 +195,7 @@ function gssa_enqueue_admin_scripts($hook) {
         'gssa-admin-js',
         plugin_dir_url(__FILE__) . 'admin.js',
         ['jquery', 'jquery-ui-datepicker'],
-        '1.9.4', 
+        '1.9.9', 
         true
     );
     wp_localize_script('gssa-admin-js', 'gssa_ajax_object', [
@@ -271,6 +278,7 @@ function gssa_start_background_process_callback() {
         gssa_spawn_cron();
         
         wp_send_json_success(['message' => 'Arka plan işlemi başarıyla başlatıldı.']);
+        wp_die();
 
     } catch (Throwable $e) {
         // Herhangi bir kritik hata veya istisnayı yakala ve logla
@@ -283,6 +291,7 @@ function gssa_start_background_process_callback() {
         gssa_add_log_entry("HATA: " . $error_message);
         update_option('gssa_process_status', 'stopped');
         wp_send_json_error(['message' => $error_message]);
+        wp_die();
     }
 }
 
@@ -305,7 +314,7 @@ function gssa_resume_background_process_callback() {
         $index = get_option('gssa_current_index', false);
         if ($index === false) {
             wp_send_json_error(['message' => 'Devam edilecek bir işlem bulunamadı. Lütfen sıfırdan başlatın.']);
-            return;
+            wp_die();
         }
         gssa_add_log_entry("İşleme index {$index}'dan devam ediliyor...");
         update_option('gssa_process_status', 'running');
@@ -313,8 +322,10 @@ function gssa_resume_background_process_callback() {
         wp_schedule_single_event(time(), 'gssa_run_analysis_cron');
         gssa_spawn_cron();
         wp_send_json_success(['message' => 'İşleme kaldığı yerden devam ediliyor.']);
+        wp_die();
     } catch (Throwable $e) {
         wp_send_json_error(['message' => 'İşlem devam ettirilemedi: ' . $e->getMessage()]);
+        wp_die();
     }
 }
 
@@ -326,13 +337,16 @@ function gssa_stop_background_process_callback() {
         update_option('gssa_process_status', 'stopped');
         gssa_add_log_entry("İşlem kullanıcı tarafından duraklatıldı.");
         wp_send_json_success(['message' => 'Arka plan işlemi duraklatıldı.']);
+        wp_die();
     } catch (Throwable $e) {
         wp_send_json_error(['message' => 'İşlem durdurulamadı: ' . $e->getMessage()]);
+        wp_die();
     }
 }
 
 add_action('wp_ajax_gssa_get_status_log', 'gssa_get_status_log_callback');
 function gssa_get_status_log_callback() {
+    ob_clean(); // Önceki tüm çıktıları temizle
     try {
         check_ajax_referer('gssa_ajax_nonce', 'nonce');
         
@@ -343,6 +357,13 @@ function gssa_get_status_log_callback() {
 
         if (!is_array($queue)) $queue = [];
         if (!is_array($log)) $log = [];
+
+        // JSON kodlamasının bozulmasını önlemek için logdaki geçersiz UTF-8 karakterlerini temizle
+        foreach ($log as $key => $value) {
+            if (is_string($value)) {
+                $log[$key] = wp_check_invalid_utf8($value, true);
+            }
+        }
         
         wp_send_json_success([
             'log' => $log, 
@@ -350,8 +371,10 @@ function gssa_get_status_log_callback() {
             'currentIndex' => (int) $current_index, 
             'totalSymbols' => count($queue)
         ]);
+        wp_die();
     } catch (Throwable $e) {
         wp_send_json_error(['message' => 'Durum bilgisi alınırken sunucu hatası oluştu: ' . $e->getMessage()]);
+        wp_die();
     }
 }
 
@@ -570,8 +593,9 @@ function gssa_process_single_stock($symbol, $analysis_types) {
         }
     
         if (in_array('pre', $analysis_types)) {
-            $pre_market_summary = gssa_calculate_summary($processed_data, $dates, 'pre_market');
-            gssa_write_summary_to_sheet($symbol, $pre_market_summary, $split_info, 'pre_market', 2.0, null);
+            $pre_market_percentage = (float) ($options['pre_market_percentage'] ?? 2.0);
+            $pre_market_summary = gssa_calculate_summary($processed_data, $dates, 'pre_market', $pre_market_percentage);
+            gssa_write_summary_to_sheet($symbol, $pre_market_summary, $split_info, 'pre_market', $pre_market_percentage, null);
         }
         if (in_array('post', $analysis_types)) {
             $post_market_percentage = (float) ($options['post_market_percentage'] ?? 2.0);
@@ -743,11 +767,11 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
     $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
     
     if ($type === 'pre_market') {
-        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%2', 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün', 'Toplam Aktif Gün'];
-        $stat_keys_base = ['total_over_threshold', 'over_threshold', 'intraday_over_2_percent', 'under_threshold', 'special_case', 'intraday_recovery', 'weak_day', 'active_days', 'total_trading_days'];
+        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
+        $stat_keys_base = ['total_over_threshold', 'over_threshold', 'intraday_over_2_percent', 'under_threshold', 'special_case', 'intraday_recovery', 'weak_day', 'active_days'];
     } elseif ($type === 'post_market') {
-        $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
-        $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days', 'total_trading_days'];
+        $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün'];
+        $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days'];
     } else { // opening_price
         $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
         $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'total_trading_days'];
@@ -806,7 +830,7 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
     
     if ($type === 'pre_market') {
         $writeSheetName = $options['write_sheet_name'];
-        $percentage_threshold = 2.0;
+        $percentage_threshold = (float) ($options['pre_market_percentage'] ?? 2.0);
     } elseif ($type === 'post_market') {
         $writeSheetName = $options['post_market_write_sheet_name'];
         $percentage_threshold = (float) ($options['post_market_percentage'] ?? 2.0);
@@ -822,9 +846,9 @@ function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
 
     if (!$is_cleared) {
         if ($type === 'pre_market') {
-            $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%2', 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün', 'Toplam Aktif Gün'];
+            $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
         } elseif ($type === 'post_market') {
-            $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün', 'Toplam Aktif Gün'];
+            $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün'];
         } else { // opening_price
              $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
         }
@@ -874,4 +898,3 @@ function gssa_get_google_client() {
     $client->setAuthConfig($credentials_array);
     return $client;
 }
-?>
