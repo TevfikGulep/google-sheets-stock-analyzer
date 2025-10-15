@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           1.9.9
+ * Version:           2.1.2
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -195,7 +195,7 @@ function gssa_enqueue_admin_scripts($hook) {
         'gssa-admin-js',
         plugin_dir_url(__FILE__) . 'admin.js',
         ['jquery', 'jquery-ui-datepicker'],
-        '1.9.9', 
+        '2.1.2', 
         true
     );
     wp_localize_script('gssa-admin-js', 'gssa_ajax_object', [
@@ -401,6 +401,10 @@ function gssa_run_analysis_cron_callback() {
     }
     
     gssa_add_log_entry("Toplu işlem başlıyor: Index {$start_index} -> " . min($start_index + GSSA_BATCH_SIZE - 1, $total_symbols - 1));
+    
+    $pre_market_rows = [];
+    $post_market_rows = [];
+    $opening_price_rows = [];
 
     $i = 0;
     for ($i = 0; $i < GSSA_BATCH_SIZE; $i++) {
@@ -419,25 +423,34 @@ function gssa_run_analysis_cron_callback() {
         gssa_add_log_entry("İşleniyor: {$symbol} (" . implode(', ', $analysis_types) . ") (" . ($current_index + 1) . "/" . $total_symbols . ")");
 
         try {
-            gssa_process_single_stock($symbol, $analysis_types);
-            gssa_add_log_entry("Başarılı: {$symbol} işlendi ve yazıldı.");
+            $processed_rows = gssa_process_single_stock($symbol, $analysis_types);
+            if (isset($processed_rows['pre_market'])) $pre_market_rows[] = $processed_rows['pre_market'];
+            if (isset($processed_rows['post_market'])) $post_market_rows[] = $processed_rows['post_market'];
+            if (isset($processed_rows['opening_price'])) $opening_price_rows[] = $processed_rows['opening_price'];
+            gssa_add_log_entry("Başarılı: {$symbol} işlendi.");
         } catch (Exception $e) {
             gssa_add_log_entry("HATA ({$symbol}): İşlem sırasında hata oluştuğu için ATLANDI. Hata: " . $e->getMessage());
-            try {
-                if (in_array('pre', $analysis_types)) {
-                    gssa_write_skipped_stock_to_sheet($symbol, 'pre_market');
-                }
-                if (in_array('post', $analysis_types)) {
-                    gssa_write_skipped_stock_to_sheet($symbol, 'post_market');
-                }
-                if (in_array('opening_price', $analysis_types)) { 
-                    gssa_write_skipped_stock_to_sheet($symbol, 'opening_price');
-                }
-                gssa_add_log_entry("Bilgi: {$symbol} için ilgili E-Tablo(lar)a atlama kaydı düşüldü.");
-            } catch (Exception $write_e) {
-                gssa_add_log_entry("UYARI: {$symbol} için atlama kaydı E-Tablo'ya yazılamadı. Hata: " . $write_e->getMessage());
-            }
+            if (in_array('pre', $analysis_types)) $pre_market_rows[] = gssa_prepare_skipped_row($symbol);
+            if (in_array('post', $analysis_types)) $post_market_rows[] = gssa_prepare_skipped_row($symbol);
+            if (in_array('opening_price', $analysis_types)) $opening_price_rows[] = gssa_prepare_skipped_row($symbol);
         }
+    }
+
+    try {
+        if (!empty($pre_market_rows)) {
+            gssa_write_batch_to_sheet($pre_market_rows, 'pre_market');
+            gssa_add_log_entry(count($pre_market_rows) . " adet pre-market sonucu E-Tablo'ya yazıldı.");
+        }
+        if (!empty($post_market_rows)) {
+            gssa_write_batch_to_sheet($post_market_rows, 'post_market');
+            gssa_add_log_entry(count($post_market_rows) . " adet post-market sonucu E-Tablo'ya yazıldı.");
+        }
+        if (!empty($opening_price_rows)) {
+            gssa_write_batch_to_sheet($opening_price_rows, 'opening_price');
+            gssa_add_log_entry(count($opening_price_rows) . " adet açılış fiyatı sonucu E-Tablo'ya yazıldı.");
+        }
+    } catch (Exception $e) {
+        gssa_add_log_entry("KRİTİK HATA: E-Tablo'ya toplu yazma işlemi başarısız oldu. Hata: " . $e->getMessage());
     }
 
     $next_index = $start_index + $i;
@@ -497,6 +510,8 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     $daily_data_api = null;
     $split_info = 'Yok';
     $has_options = 'Bilinmiyor';
+    $output_rows = [];
+    $avg_volume_30d = 0;
     
     if($needs_daily) {
         $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
@@ -512,13 +527,20 @@ function gssa_process_single_stock($symbol, $analysis_types) {
                 $split_info = sprintf('%s (%s)', $latest_split['splitRatio'], $split_date->format('Y-m-d'));
             }
         }
+        
+        if (!empty($daily_data_api['chart']['result'][0]['indicators']['quote'][0]['volume'])) {
+            $volumes = array_filter($daily_data_api['chart']['result'][0]['indicators']['quote'][0]['volume']);
+            $last_30_volumes = array_slice($volumes, -30);
+            if (!empty($last_30_volumes)) {
+                $avg_volume_30d = array_sum($last_30_volumes) / count($last_30_volumes);
+            }
+        }
     }
 
     if ($needs_options_check) {
         // Yahoo Finance Opsiyon API'si rate limit sorunları nedeniyle geçici olarak devre dışı bırakıldı.
         $has_options = 'Kontrol Devre Dışı';
     }
-
 
     if ($needs_hourly) {
         $hourly_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1h&includePrePost=true', $symbol, $start_date, $end_date);
@@ -595,20 +617,22 @@ function gssa_process_single_stock($symbol, $analysis_types) {
         if (in_array('pre', $analysis_types)) {
             $pre_market_percentage = (float) ($options['pre_market_percentage'] ?? 2.0);
             $pre_market_summary = gssa_calculate_summary($processed_data, $dates, 'pre_market', $pre_market_percentage);
-            gssa_write_summary_to_sheet($symbol, $pre_market_summary, $split_info, 'pre_market', $pre_market_percentage, null);
+            $output_rows['pre_market'] = gssa_prepare_data_row($symbol, $pre_market_summary, $split_info, 'pre_market', $pre_market_percentage, null, $avg_volume_30d);
         }
         if (in_array('post', $analysis_types)) {
             $post_market_percentage = (float) ($options['post_market_percentage'] ?? 2.0);
             $post_market_summary = gssa_calculate_summary($processed_data, $dates, 'post_market', $post_market_percentage);
-            gssa_write_summary_to_sheet($symbol, $post_market_summary, $split_info, 'post_market', $post_market_percentage, null);
+            $output_rows['post_market'] = gssa_prepare_data_row($symbol, $post_market_summary, $split_info, 'post_market', $post_market_percentage, null, $avg_volume_30d);
         }
     }
     
     if (in_array('opening_price', $analysis_types)) {
         $opening_price_percentage = (float) ($options['opening_price_percentage'] ?? 1.2);
         $opening_price_summary = gssa_calculate_opening_price_summary($daily_data_api, $timezone, $opening_price_percentage);
-        gssa_write_summary_to_sheet($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options);
+        $output_rows['opening_price'] = gssa_prepare_data_row($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options, $avg_volume_30d);
     }
+
+    return $output_rows;
 }
 
 function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $percentage_threshold = 1.2) {
@@ -661,7 +685,7 @@ function gssa_calculate_opening_price_summary($daily_data_api, $timezone, $perce
 
 
 function gssa_calculate_summary($processed_data, $dates, $type = 'pre_market', $percentage_threshold = 2.0) {
-    $summary_template = ['total_over_threshold' => 0, 'over_threshold' => 0, 'under_threshold' => 0, 'special_case' => 0, 'intraday_over_2_percent' => 0, 'intraday_recovery' => 0, 'weak_day' => 0, 'active_days' => 0, 'total_trading_days' => 0];
+    $summary_template = ['total_over_threshold' => 0, 'over_threshold' => 0, 'under_threshold' => 0, 'special_case' => 0, 'intraday_over_2_percent' => 0, 'intraday_recovery' => 0, 'weak_day' => 0, 'active_days' => 0, 'total_trading_days' => 0, 'intraday_hit_target_independently' => 0];
     $summary = ['d365' => $summary_template, 'd90' => $summary_template, 'd60' => $summary_template, 'd30' => $summary_template];
     $timezone = new DateTimeZone('America/New_York');
     $today = new DateTime('now', $timezone);
@@ -703,6 +727,14 @@ function gssa_calculate_summary($processed_data, $dates, $type = 'pre_market', $
             if ($type === 'pre_market') {
                 $high_price = $current_day_metrics['pre_market_high'];
                 $intraday_high = $current_day_metrics['intraday_high'];
+
+                if ($intraday_high !== null && $reference_close > 0) {
+                    $intraday_percentage_gain = (($intraday_high / $reference_close) - 1) * 100;
+                    if ($intraday_percentage_gain >= 2.0) { // Hardcoded 2.0 as requested
+                        $summary[$period]['intraday_hit_target_independently']++;
+                    }
+                }
+                
                 if ($high_price !== null && $reference_close > 0) {
                     $high_passed_threshold = (($high_price / $reference_close) - 1) * 100 >= $percentage_threshold;
                     if (!$high_passed_threshold) {
@@ -747,43 +779,38 @@ function gssa_calculate_summary($processed_data, $dates, $type = 'pre_market', $
     return $summary;
 }
 
-function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pre_market', $percentage_threshold = 2.0, $has_options = null) {
-    $client = gssa_get_google_client();
-    $service = new Google_Service_Sheets($client);
-    $options = get_option('gssa_settings');
-    $spreadsheetId = $options['sheet_id'];
-    
-    if ($type === 'pre_market') {
-        $writeSheetName = $options['write_sheet_name'];
-    } elseif ($type === 'post_market') {
-        $writeSheetName = $options['post_market_write_sheet_name'];
-    } else { // opening_price
-        $writeSheetName = $options['opening_price_write_sheet_name'];
-    }
-
-    $is_cleared_option_name = "gssa_{$type}_sheet_cleared";
-    $is_cleared = get_option($is_cleared_option_name, false);
-
+function gssa_get_header_row($type, $percentage_threshold) {
     $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
     
     if ($type === 'pre_market') {
-        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
-        $stat_keys_base = ['total_over_threshold', 'over_threshold', 'intraday_over_2_percent', 'under_threshold', 'special_case', 'intraday_recovery', 'weak_day', 'active_days'];
+        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Gün İçi Her Koşulda +%2', 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
     } elseif ($type === 'post_market') {
         $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün'];
-        $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days'];
     } else { // opening_price
         $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
-        $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'total_trading_days'];
     }
 
     $header_row = ['Hisse Senedi'];
     foreach ($periods as $period_label) {
         foreach($stat_headers_base as $stat_header) $header_row[] = $stat_header . ' ' . $period_label;
     }
+    $header_row[] = 'Son 30g Ort. Hacim';
     $header_row[] = 'Hisse Bölünmesi';
     if ($type === 'opening_price') {
         $header_row[] = 'Opsiyon Durumu';
+    }
+    return $header_row;
+}
+
+function gssa_prepare_data_row($symbol, $summary, $split_info, $type, $percentage_threshold, $has_options, $avg_volume_30d = 0) {
+    $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
+    
+    if ($type === 'pre_market') {
+        $stat_keys_base = ['total_over_threshold', 'over_threshold', 'intraday_over_2_percent', 'intraday_hit_target_independently', 'under_threshold', 'special_case', 'intraday_recovery', 'weak_day', 'active_days'];
+    } elseif ($type === 'post_market') {
+        $stat_keys_base = ['over_threshold', 'under_threshold', 'active_days'];
+    } else { // opening_price
+        $stat_keys_base = ['total_count', 'count', 'intraday_recovery_count', 'total_trading_days'];
     }
 
     $data_row = [$symbol];
@@ -797,88 +824,56 @@ function gssa_write_summary_to_sheet($symbol, $summary, $split_info, $type = 'pr
             }
         }
     }
+    $data_row[] = round($avg_volume_30d);
     $data_row[] = $split_info;
     if ($type === 'opening_price') {
         $data_row[] = $has_options;
     }
-
-    if (!$is_cleared) {
-        gssa_add_log_entry("İlk hisse ($type), '$writeSheetName' sayfası temizleniyor...");
-        $clear_request = new Google_Service_Sheets_ClearValuesRequest();
-        $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
-        
-        $values_to_write = [$header_row, $data_row];
-        $update_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
-        $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
-        update_option($is_cleared_option_name, true);
-    } else {
-        $values_to_write = [$data_row];
-        $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
-        $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
-    }
+    return $data_row;
 }
 
+function gssa_prepare_skipped_row($symbol) {
+    return [$symbol . ' - HATA NEDENİYLE ATLANDI'];
+}
 
-function gssa_write_skipped_stock_to_sheet($symbol, $type = 'pre_market') {
+function gssa_write_batch_to_sheet($rows, $type) {
+    if (empty($rows)) return;
+
     $client = gssa_get_google_client();
     $service = new Google_Service_Sheets($client);
     $options = get_option('gssa_settings');
-    $spreadsheetId = $options['sheet_id']; 
+    $spreadsheetId = $options['sheet_id'];
     
     if ($type === 'pre_market') {
         $writeSheetName = $options['write_sheet_name'];
-        $percentage_threshold = (float) ($options['pre_market_percentage'] ?? 2.0);
+        $percentage_threshold = (float)($options['pre_market_percentage'] ?? 2.0);
     } elseif ($type === 'post_market') {
         $writeSheetName = $options['post_market_write_sheet_name'];
-        $percentage_threshold = (float) ($options['post_market_percentage'] ?? 2.0);
+        $percentage_threshold = (float)($options['post_market_percentage'] ?? 2.0);
     } else { // opening_price
         $writeSheetName = $options['opening_price_write_sheet_name'];
-        $percentage_threshold = (float) ($options['opening_price_percentage'] ?? 1.2);
+        $percentage_threshold = (float)($options['opening_price_percentage'] ?? 1.2);
     }
-    
+
     $is_cleared_option_name = "gssa_{$type}_sheet_cleared";
     $is_cleared = get_option($is_cleared_option_name, false);
-    
-    $values_to_write = [[$symbol . ' - HATA NEDENİYLE ATLANDI']];
 
     if (!$is_cleared) {
-        if ($type === 'pre_market') {
-            $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
-        } elseif ($type === 'post_market') {
-            $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün'];
-        } else { // opening_price
-             $stat_headers_base = ['Toplam', 'Açılış >= +%' . $percentage_threshold, 'Gün İçi Telafi', 'Toplam Aktif Gün'];
-        }
-        
-        $header_row = ['Hisse Senedi'];
-        $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
-        foreach ($periods as $period_label) {
-            foreach($stat_headers_base as $stat_header) $header_row[] = $stat_header . ' ' . $period_label;
-        }
-        $header_row[] = 'Hisse Bölünmesi';
-        if ($type === 'opening_price') {
-            $header_row[] = 'Opsiyon Durumu';
-        }
-        
+        gssa_add_log_entry("İlk toplu işlem ($type), '$writeSheetName' sayfası temizleniyor...");
         $clear_request = new Google_Service_Sheets_ClearValuesRequest();
         $service->spreadsheets_values->clear($spreadsheetId, $writeSheetName, $clear_request);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
         
-        $initial_data = [$header_row, $values_to_write[0]];
-        $update_body = new Google_Service_Sheets_ValueRange(['values' => $initial_data]);
+        $header_row = gssa_get_header_row($type, $percentage_threshold);
+        array_unshift($rows, $header_row);
+        
+        $update_body = new Google_Service_Sheets_ValueRange(['values' => $rows]);
         $service->spreadsheets_values->update($spreadsheetId, $writeSheetName . '!A1', $update_body, ['valueInputOption' => 'USER_ENTERED']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
         update_option($is_cleared_option_name, true);
     } else {
-        $append_body = new Google_Service_Sheets_ValueRange(['values' => $values_to_write]);
+        $append_body = new Google_Service_Sheets_ValueRange(['values' => $rows]);
         $service->spreadsheets_values->append($spreadsheetId, $writeSheetName, $append_body, ['valueInputOption' => 'USER_ENTERED', 'insertDataOption' => 'INSERT_ROWS']);
-        usleep(500000); // API limitini aşmamak için 0.3 saniye bekle
     }
 }
-
 
 function gssa_get_google_client() {
     require_once plugin_dir_path(__FILE__) . 'vendor/autoload.php';
@@ -898,3 +893,4 @@ function gssa_get_google_client() {
     $client->setAuthConfig($credentials_array);
     return $client;
 }
+
