@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           2.1.2
+ * Version:           2.1.3
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -730,7 +730,7 @@ function gssa_calculate_summary($processed_data, $dates, $type = 'pre_market', $
 
                 if ($intraday_high !== null && $reference_close > 0) {
                     $intraday_percentage_gain = (($intraday_high / $reference_close) - 1) * 100;
-                    if ($intraday_percentage_gain >= 2.0) { // Hardcoded 2.0 as requested
+                    if ($intraday_percentage_gain >= $percentage_threshold) {
                         $summary[$period]['intraday_hit_target_independently']++;
                     }
                 }
@@ -783,7 +783,7 @@ function gssa_get_header_row($type, $percentage_threshold) {
     $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
     
     if ($type === 'pre_market') {
-        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Gün İçi Her Koşulda +%2', 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
+        $stat_headers_base = ['Toplam +%' . $percentage_threshold, 'PM +%' . $percentage_threshold . ' ve Üzeri', 'Gün içi +%' . $percentage_threshold, 'Gün İçi Her Koşulda +%' . $percentage_threshold, 'Yüzde ' . $percentage_threshold . ' Altı', 'PM Sakin Açılış +%' . $percentage_threshold, 'Gün İçi Telafi', 'Zayıf Gün', 'PM Aktif Gün'];
     } elseif ($type === 'post_market') {
         $stat_headers_base = ['Pozitif %' . $percentage_threshold . ' ve Üzeri', 'Yüzde ' . $percentage_threshold . ' Altı', 'Post-M Aktif Gün'];
     } else { // opening_price
@@ -893,4 +893,3 @@ function gssa_get_google_client() {
     $client->setAuthConfig($credentials_array);
     return $client;
 }
-
