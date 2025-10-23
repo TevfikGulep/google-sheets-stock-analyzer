@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           2.5.0
+ * Version:           2.5.1
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -540,6 +540,7 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     $avg_volume_30d = 0;
     $daily_opens = [];
     $official_closes = [];
+    $latest_close_price = 0; // GÜNCEL FİYAT İÇİN EKLENDİ
     
     if($needs_daily) {
         $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
@@ -573,6 +574,9 @@ function gssa_process_single_stock($symbol, $analysis_types) {
             if (isset($daily_quotes['close'][$i])) $official_closes[$date_key] = $daily_quotes['close'][$i];
             if (isset($daily_quotes['open'][$i])) $daily_opens[$date_key] = $daily_quotes['open'][$i];
         }
+
+        // GÜNCEL FİYAT İÇİN EKLENDİ
+        $latest_close_price = !empty($official_closes) ? end($official_closes) : 0;
     }
 
     if (in_array('opening_price', $analysis_types)) {
@@ -674,19 +678,22 @@ function gssa_process_single_stock($symbol, $analysis_types) {
         if (in_array('pre', $analysis_types)) {
             $pre_market_percentage = (float) ($options['pre_market_percentage'] ?? 2.0);
             $pre_market_summary = gssa_calculate_summary($processed_data, $dates, 'pre_market', $pre_market_percentage);
-            $output_rows['pre_market'] = gssa_prepare_data_row($symbol, $pre_market_summary, $split_info, 'pre_market', $pre_market_percentage, null, $avg_volume_30d);
+            // GÜNCEL FİYAT EKLENDİ (son parametre)
+            $output_rows['pre_market'] = gssa_prepare_data_row($symbol, $pre_market_summary, $split_info, 'pre_market', $pre_market_percentage, null, $avg_volume_30d, $latest_close_price);
         }
         if (in_array('post', $analysis_types)) {
             $post_market_percentage = (float) ($options['post_market_percentage'] ?? 2.0);
             $post_market_summary = gssa_calculate_summary($processed_data, $dates, 'post_market', $post_market_percentage);
-            $output_rows['post_market'] = gssa_prepare_data_row($symbol, $post_market_summary, $split_info, 'post_market', $post_market_percentage, null, $avg_volume_30d);
+            // GÜNCEL FİYAT EKLENDİ (son parametre)
+            $output_rows['post_market'] = gssa_prepare_data_row($symbol, $post_market_summary, $split_info, 'post_market', $post_market_percentage, null, $avg_volume_30d, $latest_close_price);
         }
     }
     
     if (in_array('opening_price', $analysis_types)) {
         $opening_price_percentage = (float) ($options['opening_price_percentage'] ?? 1.2);
         $opening_price_summary = gssa_calculate_opening_price_summary($daily_data_api, $timezone, $opening_price_percentage);
-        $output_rows['opening_price'] = gssa_prepare_data_row($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options, $avg_volume_30d);
+        // GÜNCEL FİYAT EKLENDİ (son parametre)
+        $output_rows['opening_price'] = gssa_prepare_data_row($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options, $avg_volume_30d, $latest_close_price);
     }
 
     return $output_rows;
@@ -858,6 +865,7 @@ function gssa_get_header_row($type, $percentage_threshold) {
         foreach($stat_headers_base as $stat_header) $header_row[] = $stat_header . ' ' . $period_label;
     }
     $header_row[] = 'Son 30g Ort. Hacim';
+    $header_row[] = 'Güncel Fiyat'; // GÜNCEL FİYAT İÇİN EKLENDİ
     $header_row[] = 'Hisse Bölünmesi';
     if ($type === 'opening_price') {
         $header_row[] = 'Opsiyon Durumu';
@@ -865,7 +873,8 @@ function gssa_get_header_row($type, $percentage_threshold) {
     return $header_row;
 }
 
-function gssa_prepare_data_row($symbol, $summary, $split_info, $type, $percentage_threshold, $has_options, $avg_volume_30d = 0) {
+// GÜNCEL FİYAT İÇİN FONKSİYON İMZASI GÜNCELLENDİ (son parametre)
+function gssa_prepare_data_row($symbol, $summary, $split_info, $type, $percentage_threshold, $has_options, $avg_volume_30d = 0, $latest_price = 0) {
     $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
     
     if ($type === 'pre_market') {
@@ -888,6 +897,11 @@ function gssa_prepare_data_row($symbol, $summary, $split_info, $type, $percentag
         }
     }
     $data_row[] = round($avg_volume_30d);
+    
+    // GÜNCEL FİYAT İÇİN EKLENDİ (Formatlı)
+    $formatted_price = number_format($latest_price, 2, ',', '');
+    $data_row[] = $formatted_price;
+    
     $data_row[] = $split_info;
     if ($type === 'opening_price') {
         $data_row[] = $has_options;
@@ -953,4 +967,3 @@ function gssa_get_google_client() {
     $client->setAuthConfig($credentials_array);
     return $client;
 }
-
