@@ -3,7 +3,7 @@
  * Plugin Name:       Google Sheets Stock Analyzer
  * Plugin URI:        https://oxigen.team
  * Description:       Reads stock symbols from a Google Sheet, fetches historical data from Yahoo Finance, calculates statistics, and writes the results back to the sheet.
- * Version:           2.5.1
+ * Version:           2.5.7
  * Author:            Tevfik Gülep
  * Author URI:        https://oxigen.team
  * License:           GPL-2.0-or-later
@@ -540,9 +540,15 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     $avg_volume_30d = 0;
     $daily_opens = [];
     $official_closes = [];
-    $latest_close_price = 0; // GÜNCEL FİYAT İÇİN EKLENDİ
+    // === BAŞLANGIÇ: DÜZELTME v2.5.7 ===
+    // Günlük 'high' verisini saklamak için yeni dizi
+    $daily_highs = []; 
+    // === BİTİŞ: DÜZELTME v2.5.7 ===
+    $latest_close_price = 0;
     
     if($needs_daily) {
+        // Günlük veri URL'si 'includePrePost=true' İÇERMEZ,
+        // bu nedenle 'high' değeri Borsa saatleri (09:30-16:00) içindir.
         $daily_url = sprintf('https://query1.finance.yahoo.com/v8/finance/chart/%s?period1=%d&period2=%d&interval=1d&events=splits', $symbol, $start_date, $end_date);
         $daily_response = wp_remote_get($daily_url, ['timeout' => 30]);
         if (is_wp_error($daily_response) || wp_remote_retrieve_response_code($daily_response) != 200) throw new Exception("Günlük veri çekilemedi: " . wp_remote_retrieve_response_code($daily_response));
@@ -573,9 +579,12 @@ function gssa_process_single_stock($symbol, $analysis_types) {
             $date_key = $dt->format('Y-m-d');
             if (isset($daily_quotes['close'][$i])) $official_closes[$date_key] = $daily_quotes['close'][$i];
             if (isset($daily_quotes['open'][$i])) $daily_opens[$date_key] = $daily_quotes['open'][$i];
+            // === BAŞLANGIÇ: DÜZELTME v2.5.7 ===
+            // Resmi 'high' (gün içi en yüksek) değerini dizimize kaydediyoruz.
+            if (isset($daily_quotes['high'][$i])) $daily_highs[$date_key] = $daily_quotes['high'][$i];
+            // === BİTİŞ: DÜZELTME v2.5.7 ===
         }
 
-        // GÜNCEL FİYAT İÇİN EKLENDİ
         $latest_close_price = !empty($official_closes) ? end($official_closes) : 0;
     }
 
@@ -584,6 +593,7 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     }
 
     if ($needs_hourly) {
+        // Saatlik veri (gerekli)
         $hourly_data_api = gssa_get_intraday_data($symbol, $start_date, $end_date);
 
         $hourly_data_grouped = [];
@@ -594,18 +604,31 @@ function gssa_process_single_stock($symbol, $analysis_types) {
             $date_key = $dt->format('Y-m-d');
             if ($dt->format('N') >= 6) continue;
             if (!isset($hourly_data_grouped[$date_key])) {
+                // Not: 'market_highs' dizisi artık 'intraday_high' hesaplaması için kullanılmıyor,
+                // ancak pre/post ayrımı için döngüde tutuluyor.
                 $hourly_data_grouped[$date_key] = ['pre_market_prices' => [], 'market_highs' => [], 'post_market_prices' => [], 'pre_market_opens' => [], 'post_market_volume' => 0];
             }
             $high = $hourly_quotes['high'][$i] ?? null; $low = $hourly_quotes['low'][$i] ?? null; $open = $hourly_quotes['open'][$i] ?? null; $volume = $hourly_quotes['volume'][$i] ?? 0;
-            if ($high === null || $low === null) continue;
+            
+            if ($high === null && $low === null && $open === null && $volume == 0) continue;
+
             $time = (int)$dt->format('Hi');
             if ($time >= 400 && $time <= 929) {
-                $hourly_data_grouped[$date_key]['pre_market_prices'][] = $high; $hourly_data_grouped[$date_key]['pre_market_prices'][] = $low;
-                if ($open !== null) $hourly_data_grouped[$date_key]['pre_market_opens'][] = $open;
-            } elseif ($time >= 930 && $time <= 1559) {
-                $hourly_data_grouped[$date_key]['market_highs'][] = $high;
-            } elseif ($time >= 1600 && $time <= 1659) {
-                $hourly_data_grouped[$date_key]['post_market_prices'][] = $high; $hourly_data_grouped[$date_key]['post_market_prices'][] = $low; $hourly_data_grouped[$date_key]['post_market_volume'] += $volume;
+                if ($high !== null) $hourly_data_grouped[$date_key]['pre_market_prices'][] = $high; 
+                if ($low !== null) $hourly_data_grouped[$date_key]['pre_market_prices'][] = $low;
+                if ($open !== null) {
+                    $hourly_data_grouped[$date_key]['pre_market_prices'][] = $open;
+                    $hourly_data_grouped[$date_key]['pre_market_opens'][] = $open;
+                }
+            } 
+            elseif ($time >= 930 && $time <= 1600) { 
+                if ($high !== null) $hourly_data_grouped[$date_key]['market_highs'][] = $high;
+                if ($open !== null) $hourly_data_grouped[$date_key]['market_highs'][] = $open;
+            } 
+            elseif ($time >= 1601 && $time <= 2000) { 
+                if ($high !== null) $hourly_data_grouped[$date_key]['post_market_prices'][] = $high; 
+                if ($low !== null) $hourly_data_grouped[$date_key]['post_market_prices'][] = $low; 
+                $hourly_data_grouped[$date_key]['post_market_volume'] += $volume;
             }
         }
 
@@ -619,28 +642,28 @@ function gssa_process_single_stock($symbol, $analysis_types) {
             $is_inferred_activity = false;
             $pre_market_high_for_calc = null;
 
-            $has_price_movement = false;
+            $has_any_measured_pre_market_data = false; 
+
             if (!empty($day_hourly['pre_market_prices'])) {
                 $pre_prices = array_filter($day_hourly['pre_market_prices'], 'is_numeric');
                 if (count($pre_prices) > 0) {
                      $pre_market_high_for_calc = max($pre_prices);
-                }
-                if (count($pre_prices) > 1 && max($pre_prices) > min($pre_prices)) {
-                    $has_price_movement = true;
+                     $has_any_measured_pre_market_data = true; 
                 }
             }
+            
+            if (!empty($day_hourly['pre_market_opens'])) {
+                 $has_any_measured_pre_market_data = true; 
+            }
 
-            if ($has_price_movement || !empty($day_hourly['pre_market_opens'])) {
+            if ($has_any_measured_pre_market_data) {
                 $pre_market_activity = true;
-                if (!$has_price_movement) $is_inferred_activity = true;
-            }
-
-            if (!$pre_market_activity && $previous_day_close !== null) {
+                $is_inferred_activity = false; 
+            } elseif ($previous_day_close !== null) {
                 $current_daily_open = $daily_opens[$date] ?? null;
                 if ($current_daily_open !== null && abs($current_daily_open - $previous_day_close) > 0.001) {
-                    $pre_market_activity = true;
-                    $is_inferred_activity = true;
-                    // For gap days, use the daily open as the high for calculation
+                    $pre_market_activity = true; 
+                    $is_inferred_activity = false;
                     $pre_market_high_for_calc = $current_daily_open;
                 }
             }
@@ -656,7 +679,12 @@ function gssa_process_single_stock($symbol, $analysis_types) {
             $metrics = [
                 'close' => $official_closes[$date] ?? null, 
                 'pre_market_high' => $pre_market_high_for_calc, 
-                'intraday_high' => !empty($day_hourly['market_highs']) ? max(array_filter($day_hourly['market_highs'], 'is_numeric')) : null,
+                // === BAŞLANGIÇ: DÜZELTME v2.5.7 ===
+                // 'intraday_high' artık karmaşık saatlik veriden değil,
+                // doğrudan en başta çektiğimiz güvenilir GÜNLÜK veriden geliyor.
+                'intraday_high' => $daily_highs[$date] ?? null,
+                // ESKİ: 'intraday_high' => !empty($day_hourly['market_highs']) ? max(array_filter($day_hourly['market_highs'], 'is_numeric')) : null,
+                // === BİTİŞ: DÜZELTME v2.5.7 ===
                 'post_market_high' => !empty($day_hourly['post_market_prices']) ? max(array_filter($day_hourly['post_market_prices'], 'is_numeric')) : null,
                 'pre_market_percent_diff' => null, 'post_market_percent_diff' => null, 'pre_market_open_percent' => null,
                 'pre_market_activity' => $pre_market_activity, 
@@ -678,13 +706,11 @@ function gssa_process_single_stock($symbol, $analysis_types) {
         if (in_array('pre', $analysis_types)) {
             $pre_market_percentage = (float) ($options['pre_market_percentage'] ?? 2.0);
             $pre_market_summary = gssa_calculate_summary($processed_data, $dates, 'pre_market', $pre_market_percentage);
-            // GÜNCEL FİYAT EKLENDİ (son parametre)
             $output_rows['pre_market'] = gssa_prepare_data_row($symbol, $pre_market_summary, $split_info, 'pre_market', $pre_market_percentage, null, $avg_volume_30d, $latest_close_price);
         }
         if (in_array('post', $analysis_types)) {
             $post_market_percentage = (float) ($options['post_market_percentage'] ?? 2.0);
             $post_market_summary = gssa_calculate_summary($processed_data, $dates, 'post_market', $post_market_percentage);
-            // GÜNCEL FİYAT EKLENDİ (son parametre)
             $output_rows['post_market'] = gssa_prepare_data_row($symbol, $post_market_summary, $split_info, 'post_market', $post_market_percentage, null, $avg_volume_30d, $latest_close_price);
         }
     }
@@ -692,7 +718,6 @@ function gssa_process_single_stock($symbol, $analysis_types) {
     if (in_array('opening_price', $analysis_types)) {
         $opening_price_percentage = (float) ($options['opening_price_percentage'] ?? 1.2);
         $opening_price_summary = gssa_calculate_opening_price_summary($daily_data_api, $timezone, $opening_price_percentage);
-        // GÜNCEL FİYAT EKLENDİ (son parametre)
         $output_rows['opening_price'] = gssa_prepare_data_row($symbol, $opening_price_summary, $split_info, 'opening_price', $opening_price_percentage, $has_options, $avg_volume_30d, $latest_close_price);
     }
 
@@ -792,48 +817,61 @@ function gssa_calculate_summary($processed_data, $dates, $type = 'pre_market', $
                 }
             }
             
-            $is_intraday_over_threshold = false;
+            $is_intraday_over_threshold = false; // 'under_threshold' mantığı için sıfırlanır
 
             if ($type === 'pre_market') {
+                
                 $high_price = $current_day_metrics['pre_market_high'];
+                // === BAŞLANGIÇ: DÜZELTME v2.5.7 ===
+                // $intraday_high değeri artık GÜVENİLİR (günlük veriden geliyor)
                 $intraday_high = $current_day_metrics['intraday_high'];
+                // === BİTİŞ: DÜZELTME v2.5.7 ===
 
-                if ($intraday_high !== null && $reference_close > 0) {
-                    $intraday_percentage_gain_independent = (($intraday_high / $reference_close) - 1) * 100;
-                    if ($intraday_percentage_gain_independent >= $percentage_threshold) { 
-                        $summary[$period]['intraday_hit_target_independently']++;
+                $pre_market_passed_threshold = false;
+                if ($high_price !== null && $reference_close > 0) {
+                    if ((($high_price / $reference_close) - 1) * 100 >= $percentage_threshold) {
+                        $pre_market_passed_threshold = true;
                     }
                 }
-                
-                if ($high_price !== null && $reference_close > 0) {
-                    $high_passed_threshold = (($high_price / $reference_close) - 1) * 100 >= $percentage_threshold;
-                    if (!$high_passed_threshold) {
-                        if ($intraday_high !== null) {
-                            if ($intraday_high > $reference_close) {
-                                $intraday_percentage_gain = (($intraday_high / $reference_close) - 1) * 100;
-                                if ($intraday_percentage_gain >= $percentage_threshold) {
-                                    $summary[$period]['intraday_over_2_percent']++;
-                                    $summary[$period]['total_over_threshold']++;
-                                    $is_intraday_over_threshold = true;
-                                } else {
-                                    $summary[$period]['intraday_recovery']++;
-                                }
-                            } else { 
-                                $summary[$period]['weak_day']++;
+
+                // --- Metric: Gün İçi Her Koşulda +%X (intraday_hit_target_independently) ---
+                $intraday_passed_threshold = false;
+                if ($intraday_high !== null && $reference_close > 0) {
+                    $intraday_percentage_gain = (($intraday_high / $reference_close) - 1) * 100;
+                    if ($intraday_percentage_gain >= $percentage_threshold) { 
+                        $summary[$period]['intraday_hit_target_independently']++;
+                        $intraday_passed_threshold = true;
+                    }
+                }
+
+                // --- Metrics: Gün içi +%X (intraday_over_2_percent), Gün İçi Telafi (intraday_recovery), Zayıf Gün (weak_day) ---
+                if (!$pre_market_passed_threshold) {
+                    if ($intraday_high !== null && $reference_close > 0) {
+                        if ($intraday_high > $reference_close) {
+                            if ($intraday_passed_threshold) {
+                                $summary[$period]['intraday_over_2_percent']++;
+                                $summary[$period]['total_over_threshold']++; 
+                                $is_intraday_over_threshold = true;
+                            } else {
+                                $summary[$period]['intraday_recovery']++;
                             }
+                        } else { 
+                            $summary[$period]['weak_day']++;
                         }
+                    } else {
+                        $summary[$period]['weak_day']++;
                     }
                 }
             }
             
             if ($percent_diff !== null) {
                 if ($percent_diff >= $percentage_threshold) {
-                    $summary[$period]['over_threshold']++;
+                    $summary[$period]['over_threshold']++; // PM +%X
                      if ($type === 'pre_market') {
                         $summary[$period]['total_over_threshold']++;
                     }
                 } else {
-                    if (!$is_intraday_over_threshold) {
+                    if (!$is_intraday_over_threshold) { 
                         $summary[$period]['under_threshold']++;
                     }
                 }
@@ -873,7 +911,6 @@ function gssa_get_header_row($type, $percentage_threshold) {
     return $header_row;
 }
 
-// GÜNCEL FİYAT İÇİN FONKSİYON İMZASI GÜNCELLENDİ (son parametre)
 function gssa_prepare_data_row($symbol, $summary, $split_info, $type, $percentage_threshold, $has_options, $avg_volume_30d = 0, $latest_price = 0) {
     $periods = ['d365' => '(365g)', 'd90' => '(90g)', 'd60' => '(60g)', 'd30' => '(30g)'];
     
@@ -898,7 +935,6 @@ function gssa_prepare_data_row($symbol, $summary, $split_info, $type, $percentag
     }
     $data_row[] = round($avg_volume_30d);
     
-    // GÜNCEL FİYAT İÇİN EKLENDİ (Formatlı)
     $formatted_price = number_format($latest_price, 2, ',', '');
     $data_row[] = $formatted_price;
     
